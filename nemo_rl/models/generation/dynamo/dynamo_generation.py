@@ -436,17 +436,51 @@ def _dispatch_update_weights_via_mx_remote(
     # hour on a twelve-node reservation without advancing a step.
     _TERMINAL_REFIT_MARKERS = (
         "parameter verification failed",
+        "of the engine's parameter bytes",
+        "distinct digests",
+        "inconsistent shape/dtype across ranks",
         "unsupportedreshard",
         "unsupported reshard",
+        "unsupported megatron tp shard role",
         "no destination for",
-        "coverage",
         "install_mapped",
         "dtype mismatch",
+        "missing local/global expert ids",
+        "does not end in an indexed",
+        "unexpected shard-table schema",
+        "unexpected rendezvous blob schema",
+    )
+
+    # The worker reports a refit failure in one of two shapes, and the
+    # distinction matters because the interesting failures use the second one.
+    # A handled failure returns {"status": "error", "reason": ...}. An
+    # *unhandled* one - which is what the reshard receiver raises for a
+    # verification mismatch, a coverage gap or a digest collision - surfaces as
+    # an HTTP 500, and _http_post_json turns that into
+    # {"status": "error", "http_status": 500, "raw": <body>} with no "reason"
+    # key at all. Reading only "reason" therefore classified every raised
+    # failure as transient and retried it to the deadline.
+    #
+    # The scan is restricted to these fields rather than the whole payload:
+    # matching against the serialised result would let a marker collide with a
+    # diagnostic statistic and turn a recoverable refit into a hard failure,
+    # which is the more expensive direction to be wrong in.
+    _ERROR_TEXT_FIELDS = (
+        "reason",
+        "raw",
+        "detail",
+        "error",
+        "message",
+        "exception",
+        "traceback",
+        "stderr",
     )
 
     def _is_terminal_refit_failure(result: dict[str, Any]) -> bool:
-        reason = str(result.get("reason", "")).lower()
-        return any(marker in reason for marker in _TERMINAL_REFIT_MARKERS)
+        text = " ".join(
+            str(result.get(field, "")) for field in _ERROR_TEXT_FIELDS
+        ).lower()
+        return any(marker in text for marker in _TERMINAL_REFIT_MARKERS)
 
     iteration_logs: list[dict[str, Any]] = []
     failures: list[str] = []

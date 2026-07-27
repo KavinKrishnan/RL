@@ -698,3 +698,69 @@ def test_transient_failure_is_still_retried_until_the_deadline(monkeypatch):
     )
 
     assert len(refit_posts) > 1
+
+
+# The receiver *raises* for a verification mismatch, a coverage gap and a digest
+# collision, so those arrive as an HTTP 500 whose body lands in "raw" with no
+# "reason" key. Reading only "reason" let the retry loop fire ~30 times per rank
+# on the failures that matter most.
+
+
+def test_raised_verification_failure_in_http_body_is_terminal(monkeypatch):
+    _message, refit_posts = _refit_cycle(
+        monkeypatch,
+        {
+            "status": "error",
+            "http_status": 500,
+            "raw": (
+                'Traceback (most recent call last):\n  File "receiver.py", line 950\n'
+                "RuntimeError: [reshard] parameter verification FAILED at step 2: "
+                "4 of 6192 checked shard(s) differ from the publisher's digest."
+            ),
+        },
+    )
+
+    assert len(refit_posts) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Coverage gate. The message says "refit covers ... of the engine's
+        # parameter bytes" and never the bare word "coverage".
+        "RuntimeError: refit covers 51.00% of the engine's parameter bytes "
+        "(15580000000 of 30600000000); 24 of 48 params would keep their previous values.",
+        # merge_shard_tables collision detector, the Bug 8 tripwire.
+        "ValueError: tensor 'decoder.layers.0.mlp.down_proj.weight' shard offset=0 "
+        "shape=(2048, 768) was published by multiple ranks with 2 distinct digests.",
+        "ValueError: tensor 'x' published with inconsistent shape/dtype across ranks: "
+        "(2048,)/bf16 vs (4096,)/bf16",
+    ],
+)
+def test_raised_deterministic_gates_are_terminal(monkeypatch, body):
+    _message, refit_posts = _refit_cycle(
+        monkeypatch, {"status": "error", "http_status": 500, "raw": body}
+    )
+
+    assert len(refit_posts) == 1
+
+
+def test_transient_failure_carrying_coverage_stats_is_still_retried(monkeypatch):
+    """Guards the expensive direction of a mis-classification.
+
+    Widening the scan to the whole payload would match a marker against a
+    diagnostic statistic and turn a refit that would have succeeded on the next
+    attempt into a hard failure.
+    """
+    _message, refit_posts = _refit_cycle(
+        monkeypatch,
+        {
+            "status": "error",
+            "reason": "no v2 source available",
+            "coverage": 0.51,
+            "last_coverage_record": {"coverage": 0.51, "dtype mismatch": 0},
+        },
+        timeout_seconds=1.0,
+    )
+
+    assert len(refit_posts) > 1
