@@ -308,7 +308,7 @@ def canonicalize_grouped_expert_name(
 ) -> str:
     """Replace an EP-local grouped-expert leaf index with its global ID.
 
-    Generic #496 source grouping is tensor-name based. Leaving every EP rank's
+    Generic reshard source grouping is tensor-name based. Leaving every EP rank's
     first local expert named ``weight0`` makes unrelated experts collide before
     the Megatron translator can inspect descriptor extras.
     """

@@ -530,7 +530,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mx-reshard496",
         action="store_true",
-        help="publish HF aliases and receive through merged #496 planning",
+        help="publish HF aliases and receive through merged reshard planning",
     )
     parser.add_argument(
         "--fabric",

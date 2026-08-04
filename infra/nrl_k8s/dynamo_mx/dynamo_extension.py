@@ -989,7 +989,7 @@ class MxRefitWorkerExtension:
         version: int,
         mx_config: MxConfig,
     ) -> bool:
-        """Use merged #496 against HF aliases of live Megatron shards."""
+        """Use merged reshard planning against HF aliases of live Megatron shards."""
         if not getattr(self, "_mx_reshard496_receiver", None):
             from modelexpress.engines.vllm.refit.receiver import (
                 VllmReshardReceiver,

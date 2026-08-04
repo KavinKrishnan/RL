@@ -47,7 +47,7 @@ policy:
     empty_unused_memory_level: 1
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
-      # Route native Megatron publication through merged #496 destination
+      # Route native Megatron publication through merged reshard destination
       # planning instead of the full-model compatibility receiver.
       MX_MEGATRON_RESHARD496: "1"
 
