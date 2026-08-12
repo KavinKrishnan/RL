@@ -155,6 +155,49 @@ def w_refit_once(worker):
     return {"ok": True}
 
 
+def w_param_equality(worker, rtol, atol):
+    """Compare live params against the pre-refit snapshot, per parameter.
+
+    Phase 1 wants parameter equality and not just generation agreement: a
+    mis-mapped slice can leave tokens intact while a minority of params hold the
+    wrong bytes. worker._ref is the post-load reference captured in w_setup.
+    """
+    import torch
+
+    worst_name, worst_err, mismatched = None, 0.0, []
+    with torch.no_grad():
+        live = dict(worker.model_runner.model.named_parameters())
+        for name, ref in worker._ref.items():
+            got = live.get(name)
+            if got is None:
+                mismatched.append({"name": name, "reason": "missing"})
+                continue
+            cur = got.detach().to("cpu", copy=False).to(ref.dtype)
+            if cur.shape != ref.shape:
+                mismatched.append(
+                    {
+                        "name": name,
+                        "reason": "shape",
+                        "ref": list(ref.shape),
+                        "got": list(cur.shape),
+                    }
+                )
+                continue
+            err = float((cur.float() - ref.float()).abs().max())
+            if err > worst_err:
+                worst_name, worst_err = name, err
+            if not torch.allclose(cur.float(), ref.float(), rtol=rtol, atol=atol):
+                mismatched.append({"name": name, "reason": "value", "max_abs_err": err})
+    return {
+        "params_compared": len(worker._ref),
+        "max_abs_err": worst_err,
+        "max_abs_err_param": worst_name,
+        "num_mismatched": len(mismatched),
+        # Bounded so a wholesale failure cannot flood the record.
+        "mismatched": mismatched[:20],
+    }
+
+
 def _gen(llm):
     from vllm import SamplingParams
 
@@ -218,6 +261,10 @@ def main() -> int:
     )
     ap.add_argument("--mx-server", required=True)
     ap.add_argument("--warm-cycles", type=int, default=10)
+    # bf16 refit is a byte copy, so the default is exact equality; loosen only
+    # for a quantized destination where PWAL re-derives scales.
+    ap.add_argument("--equality-rtol", type=float, default=0.0)
+    ap.add_argument("--equality-atol", type=float, default=0.0)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
@@ -317,15 +364,22 @@ def main() -> int:
     corrupt_tok = _gen(llm)
     llm.collective_rpc(w_refit_once, args=())
     post = _gen(llm)
+    equality = llm.collective_rpc(
+        w_param_equality, args=(args.equality_rtol, args.equality_atol)
+    )
+    params_equal = all(r["num_mismatched"] == 0 for r in equality)
     rec["correctness"] = {
         "installer": last_arm,
         "corruption_detected": _agree(base, corrupt_tok) < 0.999,
         "recovery_tokens": _agree(base, post),
+        "params_equal": params_equal,
+        "param_equality_per_rank": equality,
     }
     rec["result"] = (
         "PASS"
         if rec["correctness"]["corruption_detected"]
         and rec["correctness"]["recovery_tokens"] >= 0.999
+        and params_equal
         else "FAIL"
     )
 
