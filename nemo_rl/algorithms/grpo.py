@@ -76,6 +76,7 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.mx_helpers import MxConfig
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -105,6 +106,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationSamplingParams,
     resolve_routed_experts_dtype_name_for_model,
 )
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -663,6 +665,13 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    # The dynamo backend forwards rollouts to an external DynamoGraphDeployment,
+    # so it never colocates and never participates in cross-cluster collective
+    # communication. We track it as a sibling flag so downstream gates stay
+    # readable.
+    is_dynamo = generation_config.get("backend") == "dynamo"
+    if is_dynamo:
+        colocated_inference = False
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -746,7 +755,29 @@ def setup(
             flush=True,
         )
 
-    if colocated_inference:
+    if is_dynamo:
+        # Dynamo: all GPUs go to training. Inference is served by a
+        # DynamoGraphDeployment external to this Ray cluster.
+        if total_nodes == 1:
+            train_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+        else:
+            train_gpus_per_node = cluster_config["gpus_per_node"]
+
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+        )
+        inference_cluster = None
+        print(
+            f"  ✓ Dynamo backend — {policy_nodes} node(s) × {train_gpus_per_node} GPU(s) "
+            f"allocated to training (inference served by DGD)",
+            flush=True,
+        )
+
+    elif colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
@@ -1101,7 +1132,9 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            init_optimizer=True,
+            # gen_benchmark_skip_training: pure generation benchmark, no real training
+            # -> skip optimizer init (saves memory; refit needs only weights).
+            init_optimizer=not grpo_config.get("gen_benchmark_skip_training", False),
             init_reference_model=init_reference_model,
         )
         # Keep custom policy_factory call signatures backward compatible.
@@ -1411,6 +1444,30 @@ def setup(
             )
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
+    elif backend == "dynamo":
+        # Dynamo: rollouts forwarded to an external DynamoGraphDeployment over
+        # HTTP. The class itself is a thin URL wrapper; the heavy lifting lives
+        # in the DGD pods.
+        generation_config = cast(DynamoConfig, generation_config)
+
+        def init_dynamo():
+            t0 = time.perf_counter()
+            pg = DynamoGeneration(cluster=inference_cluster, config=generation_config)
+            return pg, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_dynamo,
+            colocated_inference=False,
+            setup_timing_metrics=setup_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using Dynamo backend "
+            f"(frontend: {policy_generation.dp_openai_server_base_urls[0]})",
+            flush=True,
+        )
+
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -1436,9 +1493,12 @@ def setup(
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
-    # if it is not colocated inference, initialize collective communication for update weights
+    # if it is not colocated inference, initialize collective communication for
+    # update weights. The dynamo backend skips this: the DGD has its own internal
+    # communication and pulls weights over MX rather than this collective.
     if (
         not colocated_inference
+        and not is_dynamo
         and remote_transport is None
         and checkpoint_engine_config is None
     ):
@@ -1532,7 +1592,9 @@ def setup(
     else:
         if not (nccl_reshard_refit_enabled and not colocated_inference):
             state_dict_info = policy.prepare_refit_info()
-            if policy_generation is not None:
+            # The dynamo backend receives weights over MX, so it has no refit
+            # info to prepare on the generation side.
+            if policy_generation is not None and not is_dynamo:
                 policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
@@ -2026,6 +2088,8 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     if generation_config is None:
         return False
     backend = generation_config.get("backend", "")
+    if backend == "dynamo":
+        return True
 
     if backend == "sglang":
         return bool(generation_config.get("use_async_rollouts", False))
@@ -2115,24 +2179,32 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     # Validate the setup for training with NeMo-Gym.
     # Megatron Inference is exempt: there is no difference between its sync and async engines.
     generation_config = master_config.policy["generation"]
-    if generation_config["backend"] != "megatron":
+    backend = generation_config["backend"]
+    if backend != "megatron":
         assert _should_use_async_rollouts(master_config), (
             "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
         )
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    if generation_config["backend"] == "vllm":
+    if backend == "vllm":
         should_expose_http_server = generation_config["vllm_cfg"].get(
             "expose_http_server"
         )
-    elif generation_config["backend"] == "megatron":
+        assert should_expose_http_server, (
+            "In order to use NeMo-Gym with the vllm backend, you must expose "
+            "the server via `expose_http_server: true`!"
+        )
+    elif backend == "megatron":
         should_expose_http_server = generation_config["mcore_generation_config"].get(
             "expose_http_server"
         )
-    elif generation_config["backend"] == "trtllm":
+    elif backend == "trtllm":
         should_expose_http_server = generation_config["trtllm_cfg"].get(
             "expose_http_server"
         )
+    elif backend == "dynamo":
+        # Dynamo always exposes an HTTP frontend; it is the only path in.
+        should_expose_http_server = True
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -2292,6 +2364,9 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    weight_sync_method: Optional[str] = None,
+    mx_config: Optional[Any] = None,
+    refit_version: Optional[int] = None,
 ) -> dict[str, float]:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -2376,23 +2451,48 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+            # ---- ModelExpress v2 path (rank-to-rank NIXL RDMA, MoE-aware) ----
+            if weight_sync_method == "mx":
+                if mx_config is None or not getattr(mx_config, "enabled", False):
+                    raise RuntimeError(
+                        "weight_sync_method='mx' requires an enabled MxConfig "
+                        "(cfg.cluster.weight_sync.method='mx', .enabled=True)"
+                    )
+                version = int(refit_version) if refit_version is not None else 0
+                # MX v2 is PULL-based: publish + mark_ready() must complete BEFORE
+                # dispatching the receiver refit, or the receiver's single
+                # (non-retrying) discover_v2_sources races mark_ready() (benign
+                # at 1 receiver, fatal at scale). Serialize publish -> pull.
+                # (Opposite of the NCCL collective path, which runs
+                # trainer-broadcast and receiver-recv concurrently.)
+                futures_train = policy.stream_weights_via_mx(
+                    version=version,
+                    mx_config=mx_config,
+                    kv_scales=kv_scales,
                 )
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
+                ray.get(futures_train)
+                futures_inference = policy_generation.update_weights_via_mx(
+                    version=version, mx_config=mx_config
+                )
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
             else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                # update weights through nccl (vLLM) or megatron reshard
+                # SGLang haven't implemented non-colocated inference mode.
+                if isinstance(policy_generation, SGLangGeneration):
+                    raise NotImplementedError(
+                        "SGLang haven't implemented non-colocated inference mode. "
+                    )
+                if isinstance(policy_generation, MegatronGeneration):
+                    futures_train = policy.swap_weights_via_reshard(is_source=True)
+                else:
+                    futures_train = policy.broadcast_weights_for_collective(
+                        kv_scales=kv_scales
+                    )
+                futures_inference = policy_generation.update_weights_from_collective()
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:
@@ -2703,10 +2803,34 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
+    # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
+    # Read once so per-refit call sites don't re-parse the config.
+    _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
+    _weight_sync_method = _weight_sync_cfg.get("method")
+    _mx_config = (
+        MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
+        if _weight_sync_method == "mx"
+        else None
+    )
+    if _weight_sync_method == "mx":
+        print(
+            f"  ✓ weight_sync.method='mx' (MxConfig: enabled={_mx_config.enabled}, "
+            f"server={_mx_config.mx_server_url}, same_rank_only={_mx_config.same_rank_only}, "
+            f"tree_scale_out={_mx_config.tree_scale_out})",
+            flush=True,
+        )
+
     NEED_REFIT = not (
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
+    # Dynamo only refits via weight_sync.method="mx" (MX v2 NIXL RDMA); no other
+    # method is implemented on that path.
+    if (
+        master_config.policy["generation"].get("backend") == "dynamo"
+        and _weight_sync_method != "mx"
+    ):
+        NEED_REFIT = False
     assert policy_generation is not None
 
     # Check if we need to sync KV cache scales
@@ -2753,7 +2877,9 @@ def grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
-                _refit_buffer_size_gb=refit_buffer_size_gb,
+                weight_sync_method=_weight_sync_method,
+                mx_config=_mx_config,
+                refit_version=0,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -2912,6 +3038,9 @@ def grpo_train(
                             _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(total_steps + 1),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -3376,6 +3505,9 @@ def grpo_train(
                             colocated_inference,
                             _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(total_steps + 1),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -3670,6 +3802,11 @@ def grpo_train(
                     name="train/token_mult_prob_error_plot_sample",
                 )
             del train_data
+            # Per-worker generation-metric timelines -> generation_metrics/* wandb tab.
+            # Logged as figures (media), which do NOT block the history commit: the
+            # dc3m70us baseline logs these and still commits its scalar history. The
+            # earlier "no data" was the missing step_finished commit gate on the async
+            # path (restored there), not these figures.
             if (
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
@@ -4098,17 +4235,22 @@ def async_grpo_train(
             media to NeMo Gym prompt rows.
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
-    # SGLang async rollouts do not support the async GRPO replay path.
+    # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, TRT-LLM
+    # and Dynamo; SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
-    ), (
-        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
-        "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
+    assert backend in (
+        "vllm",
+        "megatron",
+        "trtllm",
+        "dynamo",
+    ) and _should_use_async_rollouts(master_config), (
+        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine, "
+        "or the Dynamo backend. Set either "
+        "policy.generation.vllm_cfg.async_engine=true (vLLM), "
+        "policy.generation.mcore_generation_config.async_engine=true (Megatron), "
+        "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM), or "
+        "policy.generation.backend=dynamo."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
@@ -4144,10 +4286,40 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+    # gen_benchmark_skip_training: no-op-train mode for pure generation benchmarking.
+    # Skips fwd/bwd/optimizer while still refitting the (frozen) weights each step.
+    SKIP_TRAINING_BENCHMARK = master_config.grpo.get(
+        "gen_benchmark_skip_training", False
+    )
+    if SKIP_TRAINING_BENCHMARK:
+        print(
+            "⚠️ gen_benchmark_skip_training=True: policy.train() is a no-op; weights "
+            "are frozen and refit every step (generation benchmark mode).",
+            flush=True,
+        )
+        if hasattr(policy, "start_gen_benchmark_keepalive"):
+            policy.start_gen_benchmark_keepalive()
+
+    # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
+    _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
+    _weight_sync_method = _weight_sync_cfg.get("method")
+    _mx_config = (
+        MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
+        if _weight_sync_method == "mx"
+        else None
+    )
+
     NEED_REFIT = not (
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
+    # Dynamo only refits via weight_sync.method="mx" (MX v2 NIXL RDMA); no other
+    # method is implemented on that path.
+    if (
+        master_config.policy["generation"].get("backend") == "dynamo"
+        and _weight_sync_method != "mx"
+    ):
+        NEED_REFIT = False
     assert policy_generation is not None
 
     # Training state
@@ -4317,6 +4489,9 @@ def async_grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
+                weight_sync_method=_weight_sync_method,
+                mx_config=_mx_config,
+                refit_version=0,
             )
             print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
@@ -4870,11 +5045,32 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if SKIP_TRAINING_BENCHMARK:
+                        # No-op training: skip fwd/bwd/optimizer entirely (avoids the
+                        # loss-stage log_softmax OOM). Weights stay frozen and are refit
+                        # as-is below. Still supply the metrics the async loop indexes
+                        # downstream — global_valid_toks/global_valid_seqs (token-throughput
+                        # accounting at metrics["global_valid_toks"]) and gen_kl_error (the
+                        # per-step "Generation KL Error" print) — mirroring real train()'s
+                        # all_mb_metrics shape (lists, aggregated downstream). Matches
+                        # upstream/ruit/SWE_bench's gen_benchmark_skip_training.
+                        _valid_toks = int(train_data["token_mask"].sum().item())
+                        _valid_seqs = int(train_data["sample_mask"].sum().item())
+                        train_results = {
+                            "loss": torch.tensor(0.0),
+                            "grad_norm": torch.tensor(0.0),
+                            "all_mb_metrics": {
+                                "global_valid_toks": [_valid_toks],
+                                "global_valid_seqs": [_valid_seqs],
+                                "gen_kl_error": [0.0],
+                            },
+                        }
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
@@ -4900,6 +5096,9 @@ def async_grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(weight_version + 1),
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -4946,6 +5145,9 @@ def async_grpo_train(
                                 policy,
                                 policy_generation,
                                 colocated_inference,
+                                weight_sync_method=_weight_sync_method,
+                                mx_config=_mx_config,
+                                refit_version=int(weight_version),
                             )
                             POLICY_GENERATION_STALE = False
                         else:
@@ -5222,6 +5424,14 @@ def async_grpo_train(
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
 
+            # Per-worker generation-metric timelines -> generation_metrics/* wandb tab.
+            # Logged as figures (media), which do NOT block the history commit: the
+            # dc3m70us baseline logs these on this SAME async path and still commits 15
+            # history rows (the figures show as None in scan_history because they're media,
+            # but the scalar history commits fine). The earlier "no data" / scan_history=0
+            # was the missing step_finished commit gate on the final per-step log below
+            # (this async path had regressed to omit it, unlike the sync path) -- NOT these
+            # figures. Keep both: figures for the tab, step_finished for the commit.
             if (
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
@@ -5320,10 +5530,7 @@ def async_grpo_train(
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
-                timing_metrics,
-                step + 1,
-                prefix="timing/train",
-                step_finished=True,
+                timing_metrics, step + 1, prefix="timing/train", step_finished=True
             )
 
             timer.reset()

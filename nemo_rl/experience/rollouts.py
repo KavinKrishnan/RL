@@ -533,7 +533,8 @@ async def generate_responses_async(
 
     # Check if this is a supported inference engine with async generation enabled.
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
-    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag;
+    # Dynamo is intrinsically async (HTTP-only).
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -557,6 +558,8 @@ async def generate_responses_async(
                 "async_engine", False
             )
         )
+    elif backend == "dynamo":
+        use_async_generation = True
     else:
         use_async_generation = False
 
@@ -564,8 +567,8 @@ async def generate_responses_async(
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
         "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
-        "policy.generation.mcore_generation_config.async_engine=True. The "
-        "generation backend must also implement generate_async."
+        "policy.generation.mcore_generation_config.async_engine=True. For Dynamo, "
+        "async is always on. The generation backend must also implement generate_async."
     )
 
     # Use async generation with per-sample streaming
@@ -1336,7 +1339,7 @@ async def run_sample_multi_turn_rollout(
     max_gen_tokens_per_turn = max(turn_gen_tokens) if turn_gen_tokens else 0
 
     # Sample metrics
-    sample_metrics = {
+    sample_metrics: dict[str, Any] = {
         "turn_count": turn_count,
         "total_tokens": token_count,
         "assistant_tokens": assistant_token_count,
@@ -1352,6 +1355,9 @@ async def run_sample_multi_turn_rollout(
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
+    if per_worker_token_counts:
+        # Pass-through per-worker per-turn accounting for aggregation at batch level.
+        sample_metrics["per_worker_token_counts"] = per_worker_token_counts
 
     return final_sample_state, sample_metrics
 
