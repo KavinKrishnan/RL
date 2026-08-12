@@ -329,3 +329,173 @@ def test_published_byte_count_sums_shard_boxes():
     published = build_hf_aliases(items, agent_name="trainer-r0")
 
     assert published_byte_count(published) == 16 * 2
+
+
+# --- whole-model name coverage --------------------------------------------
+#
+# Qwen3-30B-A3B-Instruct-2507's real geometry. The expected HF name set below is
+# generated from these constants rather than shipped as a fixture, and the
+# generator was checked against the checkpoint's own
+# model.safetensors.index.json on 2026-08-12: 18,867 names, exact match, nothing
+# missing and nothing extra.
+QWEN3_30B_A3B = {
+    "layers": 48,
+    "experts": 128,
+    "tie_word_embeddings": False,
+}
+
+
+def _expected_hf_names(layers: int, experts: int, tie_word_embeddings: bool) -> set[str]:
+    """The tensor names the HF checkpoint actually contains."""
+    names = {"model.embed_tokens.weight", "model.norm.weight"}
+    if not tie_word_embeddings:
+        names.add("lm_head.weight")
+    for layer in range(layers):
+        head = f"model.layers.{layer}"
+        names.update(
+            {
+                f"{head}.input_layernorm.weight",
+                f"{head}.post_attention_layernorm.weight",
+                f"{head}.mlp.gate.weight",
+                f"{head}.self_attn.q_proj.weight",
+                f"{head}.self_attn.k_proj.weight",
+                f"{head}.self_attn.v_proj.weight",
+                f"{head}.self_attn.o_proj.weight",
+                f"{head}.self_attn.q_norm.weight",
+                f"{head}.self_attn.k_norm.weight",
+            }
+        )
+        for expert in range(experts):
+            stem = f"{head}.mlp.experts.{expert}"
+            names.update(
+                {
+                    f"{stem}.gate_proj.weight",
+                    f"{stem}.up_proj.weight",
+                    f"{stem}.down_proj.weight",
+                }
+            )
+    return names
+
+
+def _bridge_map_for_rank(layers: int, local_experts: int) -> dict[str, list[str]]:
+    """A Bridge map as seen from ONE EP rank.
+
+    The Bridge walks one rank's module tree, so grouped-expert keys carry the
+    **EP-local** leaf index and the HF names it returns describe that local
+    expert. Every rank's map therefore looks identical and describes experts
+    0..local_experts-1 -- which is exactly why the resolver has to substitute the
+    global id, and why a map keyed on the global name would be the easier thing
+    to test and the wrong thing to test.
+    """
+    name_map: dict[str, list[str]] = {
+        "embedding.word_embeddings.weight": ["model.embed_tokens.weight"],
+        "decoder.final_layernorm.weight": ["model.norm.weight"],
+        "output_layer.weight": ["lm_head.weight"],
+    }
+    for layer in range(layers):
+        megatron = f"decoder.layers.{layer}"
+        hf = f"model.layers.{layer}"
+        name_map[f"{megatron}.self_attention.linear_qkv.weight"] = [
+            f"{hf}.self_attn.q_proj.weight",
+            f"{hf}.self_attn.k_proj.weight",
+            f"{hf}.self_attn.v_proj.weight",
+        ]
+        name_map[f"{megatron}.self_attention.linear_proj.weight"] = [
+            f"{hf}.self_attn.o_proj.weight"
+        ]
+        name_map[f"{megatron}.self_attention.q_layernorm.weight"] = [
+            f"{hf}.self_attn.q_norm.weight"
+        ]
+        name_map[f"{megatron}.self_attention.k_layernorm.weight"] = [
+            f"{hf}.self_attn.k_norm.weight"
+        ]
+        name_map[f"{megatron}.input_layernorm.weight"] = [f"{hf}.input_layernorm.weight"]
+        name_map[f"{megatron}.pre_mlp_layernorm.weight"] = [
+            f"{hf}.post_attention_layernorm.weight"
+        ]
+        name_map[f"{megatron}.mlp.router.weight"] = [f"{hf}.mlp.gate.weight"]
+        for local in range(local_experts):
+            name_map[f"{megatron}.mlp.experts.linear_fc1.weight{local}"] = [
+                f"{hf}.mlp.experts.{local}.gate_proj.weight",
+                f"{hf}.mlp.experts.{local}.up_proj.weight",
+            ]
+            name_map[f"{megatron}.mlp.experts.linear_fc2.weight{local}"] = [
+                f"{hf}.mlp.experts.{local}.down_proj.weight"
+            ]
+    return name_map
+
+
+def _publish_whole_model(ep_size: int) -> dict[str, set[int]]:
+    """Resolve every rank's publish set; return hf name -> owning EP ranks."""
+    layers = QWEN3_30B_A3B["layers"]
+    local_experts = QWEN3_30B_A3B["experts"] // ep_size
+    owners: dict[str, set[int]] = {}
+
+    for ep_rank in range(ep_size):
+        resolve = make_bridge_resolver(_bridge_map_for_rank(layers, local_experts))
+        entries: list[tuple[str, dict[str, str]]] = [
+            (key, {})
+            for key in _bridge_map_for_rank(layers, local_experts)
+            if ".experts.linear_fc" not in key
+        ]
+        for layer in range(layers):
+            megatron = f"decoder.layers.{layer}"
+            for local in range(local_experts):
+                global_id = ep_rank * local_experts + local
+                for fused in ("linear_fc1", "linear_fc2"):
+                    entries.append(
+                        (
+                            f"{megatron}.mlp.experts.{fused}.weight{global_id}",
+                            {
+                                "expert_id": str(global_id),
+                                "local_expert_id": str(local),
+                                "expert_layout": "grouped",
+                            },
+                        )
+                    )
+        for name, extras in entries:
+            for hf_name in resolve(name, extras):
+                owners.setdefault(hf_name, set()).add(ep_rank)
+    return owners
+
+
+def test_ep8_publishes_every_checkpoint_tensor_exactly_once_per_owner():
+    """Whole-model coverage: the union of 8 EP ranks is the checkpoint, exactly.
+
+    A name the fleet never publishes is a coverage shortfall the receiver reports
+    far from its cause; a name it publishes that the model does not have is an
+    install into a buffer nothing owns.
+    """
+    owners = _publish_whole_model(ep_size=8)
+    expected = _expected_hf_names(**QWEN3_30B_A3B)
+
+    assert set(owners) - expected == set(), "published names absent from the checkpoint"
+    assert expected - set(owners) == set(), "checkpoint tensors nobody publishes"
+    assert len(owners) == 18867
+
+
+def test_every_expert_has_exactly_one_owner_under_ep8():
+    """EP partitions experts, so two ranks claiming one expert means the global id
+    substitution failed and one rank is publishing another's weights."""
+    owners = _publish_whole_model(ep_size=8)
+
+    experts = {name: rank for name, rank in owners.items() if ".experts." in name}
+    assert len(experts) == 48 * 128 * 3
+    assert {len(rank) for rank in experts.values()} == {1}
+
+
+def test_non_expert_tensors_are_published_by_every_rank():
+    """Not a defect: with TP1 the collector keeps replicated tensors on all ranks,
+    so the fleet offers 8 byte-identical copies and the receiver's merge picks one.
+    Recorded because it is the DP amplification c2 removes, and because a change
+    here silently changes the wire bytes of every measurement."""
+    owners = _publish_whole_model(ep_size=8)
+
+    non_expert = {
+        name: rank for name, rank in owners.items() if ".experts." not in name
+    }
+    assert len(non_expert) == 435
+    assert {len(rank) for rank in non_expert.values()} == {8}
+
+    # 18,432 expert offers + 435 x 8 replicated offers.
+    assert sum(len(rank) for rank in owners.values()) == 21912
