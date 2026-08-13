@@ -1,0 +1,105 @@
+# MX-main validation — real Megatron EP publisher, node index 1 of an EP8 pair.
+#
+# Identical to mxmain_megatron_pub.gb200.yaml except for the pod name. Ranks 4-7 of
+# an EP8 publish run here, with MASTER_ADDR pointing at pod 0. Kept as its own file
+# rather than a replica count because each pod's ranks are launched by exec.
+#
+# Runs ep_publisher_reshard.py, which publishes HF-aliased shard tables through MX
+# main's publish_registered_shard_table. Distinct from reshard_publisher_sharded.py,
+# which EMULATES an FSDP8xEP8 trainer by slicing safetensors: that one never builds a
+# Megatron model, so it cannot exercise name resolution, expert-id globalisation or
+# native shard geometry. The July GB200 numbers came from the emulated publisher.
+#
+# One pod per node, 4 ranks inside it under torchrun. EP8 uses two of these pods with
+# --nnodes=2, so the pod name carries a node index.
+#
+# Deliberately no PYTORCH_CUDA_ALLOC_CONF=expandable_segments here, unlike the
+# receiver: expandable segments break NIXL memory registration on the publisher, whose
+# whole job is holding registered buffers.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mxmain-mega-pub-1
+  labels:
+    kai.scheduler/queue: dynamo
+    mx.nvidia.com/benchmark: mxmain-validation
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: >-
+      [{"interfaceName":"eth0","network":"default"},
+       {"interfaceName":"rdma0","network":"rdma-0"},
+       {"interfaceName":"rdma1","network":"rdma-1"},
+       {"interfaceName":"rdma2","network":"rdma-2"},
+       {"interfaceName":"rdma3","network":"rdma-3"}]
+spec:
+  restartPolicy: Never
+  schedulerName: kai-scheduler
+  imagePullSecrets:
+    - name: nvcr-imagepullsecret
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: pub
+      # Pinned by digest, not just tag: the tag is mutable and a silent retag would
+      # invalidate every number attributed to MX 46da339c.
+      image: nvcr.io/nvidian/dynamo-dev/nemo-rl:mxmain-46da339c@sha256:e03feb50e67552af00722128a93b83b2ccda42a5a6465fea25b54ed43579eb00
+      command: [sleep, infinity]
+      env:
+        - {name: HF_HOME, value: /mnt/rl-workspace/kavink/hf-cache}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: MX_POOL_REG, value: "1"}
+        - {name: UCX_TLS, value: "^tcp"}
+        - {name: NIXL_UCX_TLS, value: "^tcp"}
+        - {name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0"}
+        - {name: UCX_IB_GID_INDEX, value: "3"}
+        - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+        - {name: MX_RDMA_NIC_PIN, value: "off"}
+        - {name: MODEL_EXPRESS_URL, value: "miles-modelexpress-server.kavin.svc.cluster.local:8001"}
+        - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        requests:
+          cpu: "48"
+          memory: 500Gi
+          nvidia.com/gpu: "4"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+        limits:
+          # 4 Megatron ranks each stream the full HF checkpoint through host memory
+          # while building their EP shard, so this is sized well above the model.
+          cpu: "96"
+          memory: 800Gi
+          nvidia.com/gpu: "4"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      volumeMounts:
+        - {name: workspace, mountPath: /mnt/rl-workspace}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi

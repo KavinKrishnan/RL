@@ -137,6 +137,42 @@ def _nearest_keys(name: str, resolved: dict[str, tuple[str, ...]], limit: int = 
     return sorted(near)[:limit] or sorted(resolved)[:limit]
 
 
+# Roles whose Megatron parameter fuses the gated MLP's two projections into one
+# tensor, so MX has to split it and assign the halves to two HF names.
+_GATED_ROLES = frozenset({"gated_mlp_column", "expert_column"})
+
+
+def _gated_mlp_extras(name: str, role: str, hf_names: tuple[str, ...]) -> dict[str, str]:
+    """The ``gated_mlp_order`` stamp MX requires for a fused gate/up parameter.
+
+    MX refuses to infer this, correctly: it assigns the first half of the fused
+    tensor to ``hf_names[0]`` and the second to ``hf_names[1]``, so if the storage
+    order is actually the other way round it publishes the gate projection's bytes
+    under the up projection's name. Both names then receive exactly the bytes their
+    publisher advertised, so every digest agrees and the model is simply wrong.
+
+    Megatron-Core stores a gated ``linear_fc1`` as ``[gate; up]`` concatenated on
+    the output axis -- that is the layout its SwiGLU expects when it chunks the
+    activation in two. So the order is known, but the *name* order is not ours: the
+    Bridge supplies ``hf_names``, and a mapping that listed up before gate would
+    make the stamp a lie. Rather than trust it, check the names look like the
+    order being claimed, and refuse when they do not -- an unrecognised naming
+    convention should stop the publish, not silently transpose a projection.
+    """
+    if role not in _GATED_ROLES or len(hf_names) != 2:
+        return {}
+    first, second = hf_names[0].lower(), hf_names[1].lower()
+    if "gate" in first and "up" in second:
+        return {"gated_mlp_order": "gate_then_up"}
+    raise ValueError(
+        f"{name}: role {role!r} fuses a gated MLP, but its HF names "
+        f"{hf_names!r} do not read as (gate, up). Megatron stores this parameter "
+        f"as [gate; up] and MX assigns the halves positionally, so publishing "
+        f"under an unverified name order would transpose the two projections "
+        f"undetectably."
+    )
+
+
 def build_megatron_alias_inputs(
     publish_set: Iterable[tuple[str, Any, MegatronRoleSpec, dict[str, str]]],
     *,
@@ -167,6 +203,9 @@ def build_megatron_alias_inputs(
         if not hf_names:
             continue
 
+        alias_extras = dict(extras)
+        alias_extras.update(_gated_mlp_extras(name, spec.role, tuple(hf_names)))
+
         geometry = infer_megatron_tp_shard_geometry(
             local_shape=tuple(int(dim) for dim in tensor.shape),
             role=spec.role,
@@ -187,7 +226,7 @@ def build_megatron_alias_inputs(
                 placement_kind=PLACEMENT_REPLICATE,
                 shard_axis=None,
                 local_shard_range=None,
-                extras=dict(extras),
+                extras=alias_extras,
             )
             continue
 
@@ -200,7 +239,7 @@ def build_megatron_alias_inputs(
             placement_kind=PLACEMENT_SHARD,
             shard_axis=int(geometry.shard_axis),
             local_shard_range=tuple(geometry.local_shard_range),
-            extras=dict(extras),
+            extras=alias_extras,
         )
 
 

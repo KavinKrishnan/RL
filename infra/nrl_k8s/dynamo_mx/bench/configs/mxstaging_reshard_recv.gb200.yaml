@@ -1,0 +1,111 @@
+# MX-staging validation — vLLM reshard receiver (2 GPU TP2 + 4 RDMA rails).
+#
+# Identical to mxmain_reshard_recv.gb200.yaml except for the image and pod name. The
+# image carries kavink/mx-parity-staging at 09aa2e9: MX main 46da339 plus the batched
+# re-slice (c1), replica dedup and source spreading (c2), and the per-plan descriptor
+# cache.
+#
+# This image is NOT a drop-in stand-in for main. The batched re-slice, the spreading
+# and the descriptor cache are env-gated, but c2's replica dedup is unconditional by
+# design -- it was landed as the branch's single behaviour change. So the pre-dedup
+# wire-byte baseline has to come from the main image, and this image is what the
+# deduped rows are measured on. That difference is the point of the comparison: at
+# EP4 the main image moved 9.00 GiB of duplicated non-expert bytes per rank.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mxstaging-reshard-recv
+  labels:
+    kai.scheduler/queue: dynamo
+    mx.nvidia.com/benchmark: mxmain-validation
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: >-
+      [{"interfaceName":"eth0","network":"default"},
+       {"interfaceName":"rdma0","network":"rdma-0"},
+       {"interfaceName":"rdma1","network":"rdma-1"},
+       {"interfaceName":"rdma2","network":"rdma-2"},
+       {"interfaceName":"rdma3","network":"rdma-3"}]
+spec:
+  restartPolicy: Never
+  schedulerName: kai-scheduler
+  imagePullSecrets:
+    - name: nvcr-imagepullsecret
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: recv
+      # Digest-pinned: see the publisher manifest for why the tag alone is not enough.
+      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:mxstaging-09aa2e9@sha256:27bc39fe24a780f0b5dc584e7d66f86f771a90708fac0233638bc2c504a74ada
+      command: [sleep, infinity]
+      env:
+        - {name: HF_HOME, value: /mnt/rl-workspace/kavink/hf-cache}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: MX_POOL_REG, value: "1"}
+        - {name: MX_GPU_MEM_UTIL, value: "0.45"}
+        - {name: UCX_TLS, value: "^tcp"}
+        - {name: NIXL_UCX_TLS, value: "^tcp"}
+        - {name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0"}
+        - {name: UCX_IB_GID_INDEX, value: "3"}
+        - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+        - {name: MX_RDMA_NIC_PIN, value: "off"}
+        - {name: VLLM_ALLOW_INSECURE_SERIALIZATION, value: "1"}
+        - {name: MODEL_EXPRESS_URL, value: "miles-modelexpress-server.kavin.svc.cluster.local:8001"}
+        # Overrides the 381.6 baked into the base image, which is 4 rails x 95.4 Gbps
+        # -- a 100 GbE assumption from an earlier cluster. These A4X GB200 nodes report
+        # "400 Gb/sec (8X HDR)" on all four of mlx5_0..3, so the node carries 1600 Gbps
+        # and a TP2 receiver sharing it has a per-rank ceiling near 800.
+        #
+        # The stale value does not merely under-report: MX aborts the refit when the
+        # implied rate exceeds the ceiling, on the reasoning that an impossible rate
+        # means the transport reported completions it never earned. At 381.6 a perfectly
+        # healthy 405.8 Gbps pull is rejected as a fabric lie. Raising it keeps the guard
+        # -- which exists because a run once "moved" 40 GB in 0.84 s having delivered
+        # nothing -- while stopping it from firing on this fabric's real speed.
+        - {name: MX_RESHARD_MAX_GBPS, value: "800"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        requests:
+          cpu: "32"
+          memory: 400Gi
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+        limits:
+          cpu: "48"
+          memory: 560Gi
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      volumeMounts:
+        - {name: workspace, mountPath: /mnt/rl-workspace}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi

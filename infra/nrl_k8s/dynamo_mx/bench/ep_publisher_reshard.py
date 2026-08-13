@@ -70,6 +70,38 @@ print(
     flush=True,
 )
 
+from modelexpress.client import MxClient  # noqa: E402
+from modelexpress.nixl_transfer import NixlTransferManager  # noqa: E402
+from modelexpress.refit.reshard.rendezvous import MxReshardRendezvous  # noqa: E402
+
+# The NIXL agent is created BEFORE the model loads, and the order is load-bearing.
+#
+# Bringing it up after the Megatron weight load leaves UCX with no InfiniBand and
+# no CUDA component: it reports `UCX_IB_GID_INDEX` and `UCX_CUDA_COPY_DMABUF` as
+# "unused environment variables", warns that `mlx5_0:1..mlx5_3:1` "are not
+# available" while offering only the tcp devices, and then, because UCX_TLS=^tcp
+# excludes tcp, fails agent construction outright with
+# "no active messages transport ... self/memory, sysv/memory, posix/memory" ->
+# NIXL_ERR_BACKEND. Constructing the agent first, with everything else identical,
+# loads both components and the same env vars are consumed. The devices are fine
+# either way -- ibv_devinfo shows all four mlx5 ports ACTIVE before and after.
+#
+# Bringing the transport up first is also the better failure ordering: a fabric
+# problem now costs seconds instead of surfacing after a 40 s model load, where it
+# reads as a publisher fault.
+client = MxClient(MX_URL)
+manager = NixlTransferManager(
+    agent_name=f"{socket.gethostname()}-ep{EP}-pub-r{ep_rank}",
+    device_id=DEV_ID,
+    listen_port=LISTEN_PORT,
+)
+# Constructing the manager does not create the NIXL agent; register_tensors
+# raises "NIXL agent not initialized" without this. It also starts the listen
+# thread the receiver's P2P handshake connects back to, so it must happen before
+# the endpoint is advertised in the rendezvous blob.
+manager.initialize()
+print(f"[pub r{RANK}] NIXL agent up on device {DEV_ID}, port {LISTEN_PORT}", flush=True)
+
 from megatron.bridge import AutoBridge  # noqa: E402
 
 t0 = time.perf_counter()
@@ -86,10 +118,6 @@ provider.finalize()
 model_list = provider.provide_distributed_model(wrap_with_ddp=False)
 model = model_list[0] if isinstance(model_list, list) else model_list
 print(f"[pub r{RANK}] model loaded EP={EP} in {time.perf_counter()-t0:.1f}s", flush=True)
-
-from modelexpress.client import MxClient  # noqa: E402
-from modelexpress.nixl_transfer import NixlTransferManager  # noqa: E402
-from modelexpress.refit.reshard.rendezvous import MxReshardRendezvous  # noqa: E402
 
 from nemo_rl.distributed.mx_megatron_helpers import (  # noqa: E402
     collect_megatron_publish_set,
@@ -180,12 +208,6 @@ print(
     flush=True,
 )
 
-client = MxClient(MX_URL)
-manager = NixlTransferManager(
-    agent_name=f"{socket.gethostname()}-ep{EP}-pub-r{ep_rank}",
-    device_id=DEV_ID,
-    listen_port=LISTEN_PORT,
-)
 # Registering the packed views rather than the arena tensor: register_tensors
 # builds the per-name descriptors the transport matches on, and under
 # MX_POOL_REG=1 it collapses them to the one allocation the arena occupies, so
@@ -230,7 +252,11 @@ try:
         flush=True,
     )
     if READY_FILE:
-        with open(f"{READY_FILE}", "w") as handle:
+        # Per-rank path. Every rank publishes its own source, so one shared file
+        # would report whichever rank wrote last and a launcher waiting on it
+        # would start the receiver while other ranks are still loading -- which
+        # surfaces as a rendezvous quorum timeout, not as a missing publisher.
+        with open(f"{READY_FILE}.r{ep_rank}", "w") as handle:
             handle.write(f"{source_id}\n")
 
     # No collective after publishing: ranks publish independently and the

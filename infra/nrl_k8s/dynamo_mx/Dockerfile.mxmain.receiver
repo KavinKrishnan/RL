@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Receiver overlay for validating ModelExpress `main`: vLLM inference side.
+#
+# Base is the image that produced the July Topology A/B reference numbers, so it
+# already carries a matched vLLM / torch / NIXL triple that is known to bring up
+# RDMA on GB200 RoCE. Only the MX client moves, which is what makes the July
+# numbers a usable point of comparison rather than a different experiment.
+#
+# Keep MX_REF identical to the trainer overlay's. A publisher and receiver at
+# different MX commits can still handshake -- the shard table is versioned, not
+# commit-stamped -- so a mismatch does not fail loudly, it silently measures a
+# combination nobody intends to ship.
+#
+# No `# syntax=` directive on purpose: resolving an external frontend needs
+# registry-1.docker.io, which this build host cannot reach from inside a builder
+# container. Docker's built-in frontend already supports the RUN heredocs below.
+#
+# Build with the `default` (docker driver) builder, not a docker-container one:
+# the docker driver reads the local image store, so the ~40 GB arm64 base is
+# neither re-pulled nor re-exported. Needs host binfmt/qemu for arm64 on x86:
+#   docker run --privileged --rm tonistiigi/binfmt --install arm64
+#
+#   docker buildx build --builder default --allow network.host --platform linux/arm64 \
+#     --build-arg MX_REF=46da339... \
+#     -t nvcr.io/nvidian/dynamo-dev/model-express-dev:mxmain-<sha8> \
+#     -f infra/nrl_k8s/dynamo_mx/Dockerfile.mxmain.receiver .
+
+ARG BASE_IMAGE=nvcr.io/nvidian/dynamo-dev/model-express-dev:istvan-b-4efa-20260728-v44
+FROM ${BASE_IMAGE}
+
+ARG MX_REF=46da339c9fae4c686a236ee03d2a733698e056e4
+# Must stay quoted, and see the trainer overlay for why the smoke stage pins the
+# resolved commit: an unquoted default truncates at the first space and pip then
+# no-ops against the base's own MX without failing anything.
+ARG MX_SPEC="modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git@${MX_REF}#subdirectory=modelexpress_client/python"
+
+USER root
+
+# --no-deps for the same reason as the trainer overlay: MX declares nixl and the
+# nvidia-cu* stack, and letting pip resolve those would move the CUDA minor and
+# the NIXL build out from under a vLLM that is already known to work on this
+# fabric. The base's NIXL 0.10.1 is kept exactly as the July runs had it.
+#
+# --network=host because the corporate nameservers on this build host answer only
+# from the host netns; a bridge-network build sandbox cannot resolve github.com even
+# with the correct resolv.conf. Requires `--allow network.host` on the invocation.
+RUN --network=host /opt/dynamo/venv/bin/pip install --no-cache-dir --no-deps --force-reinstall "${MX_SPEC}" \
+ && /opt/dynamo/venv/bin/pip install --no-cache-dir "grpcio>=1.66.2" "protobuf>=6.31,<7"
+
+# Smoke: the vLLM receive seam must be present, the v2 client must be gone, and
+# vLLM itself must still import after the swap. The last check is not paranoia --
+# the protobuf floor above is the one dependency this overlay does move, and vLLM
+# links its own protobuf-generated modules.
+RUN set -eux; \
+    /opt/dynamo/venv/bin/python -c "\
+import importlib.metadata as md; \
+from modelexpress.refit.reshard.receiver import ReshardReceiver; \
+from modelexpress.refit.reshard.rendezvous import MxReshardRendezvous, unwrap_rendezvous_blob; \
+from modelexpress.engines.vllm.refit.receiver import VllmReshardReceiver; \
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing; \
+import vllm, nixl._api; \
+print('receiver overlay: MX', md.version('modelexpress'), 'vLLM', md.version('vllm'), 'seam OK'); \
+"; \
+    MX_REF="${MX_REF}" /opt/dynamo/venv/bin/python - <<'PY'
+import importlib
+import importlib.metadata as md
+import json
+import os
+
+# See the trainer overlay: this is the only assertion that distinguishes the
+# overlay's MX from the base image's own.
+want = os.environ["MX_REF"]
+raw = md.distribution("modelexpress").read_text("direct_url.json")
+if raw is None:
+    raise SystemExit(
+        "modelexpress has no direct_url.json: it came from an index or was never "
+        f"reinstalled, so this image is not MX {want[:8]}"
+    )
+got = json.loads(raw).get("vcs_info", {}).get("commit_id", "")
+if got != want:
+    raise SystemExit(f"MX commit mismatch: image has {got[:12] or '<none>'}, expected {want[:12]}")
+
+for gone in ("modelexpress.nemo_rl_v2", "modelexpress.engines.vllm.weight_update"):
+    try:
+        importlib.import_module(gone)
+    except ImportError:
+        continue
+    raise SystemExit(f"{gone} is still importable: the v2 client was not replaced")
+
+print(f"receiver overlay: MX pinned at {got[:12]}, v2 surface absent as expected")
+PY

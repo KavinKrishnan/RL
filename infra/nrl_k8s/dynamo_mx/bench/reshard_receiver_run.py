@@ -113,25 +113,72 @@ def w_refit_timed(worker, n, installer_name):
         )
         t0 = time.perf_counter()
         with use_refit_timing(rec):
-            recv.update_weights(step)
+            # update_weights returns its own stage timings and byte economics.
+            # That return value is the only instrument that covers this path: the
+            # reshard receiver does not write into the ambient RefitTimingRecorder
+            # (only the vLLM MDL installer does), so reading the recorder's
+            # wire_transfer/installation stages reports a confident 0.0 ms for
+            # every stage of a refit that plainly took seconds. The recorder stays
+            # in scope because the installer leg does use it.
+            metrics = recv.update_weights(step)
             torch.cuda.synchronize()
         totals.append((time.perf_counter() - t0) * 1e3)
         rec.finish()
-        records.append(rec.as_dict())
+        records.append({"mx": metrics, "recorder": rec.as_dict()})
         step += 1
     worker._refit_step = step
 
-    def stage(name):
-        return [r["stages"][name]["duration_ms"] for r in records]
+    def ms(metrics, *names):
+        return sum(float(metrics.get(n, 0.0)) for n in names) * 1e3
 
+    def per_cycle(fn):
+        return [fn(r["mx"]) for r in records]
+
+    # The wire leg is reported under different keys depending on whether the fused
+    # single-transfer path ran, so sum whichever are present instead of naming one.
+    def wire_ms(metrics):
+        return (
+            sum(
+                float(v)
+                for k, v in metrics.items()
+                if k.startswith("wire_") and k.endswith("_s")
+            )
+            * 1e3
+        )
+
+    # Only duration keys end in _s; counts such as reslice_copies do not, so this
+    # stays a time sum. The stages are sequential on this path, so summing them is
+    # valid -- revisit if any leg is ever overlapped.
+    def accounted_ms(metrics):
+        return sum(float(v) for k, v in metrics.items() if k.endswith("_s")) * 1e3
+
+    e2e = totals
+    acc = per_cycle(accounted_ms)
     bytes_planned = recv._plan.bytes_planned() if recv._plan is not None else 0
     return {
-        "e2e_ms": totals,
-        "install_ms": stage("installation"),
-        "quantization_ms": stage("transformation"),
-        "transfer_ms": stage("wire_transfer"),
-        "unattributed_ms": [r["unattributed_ms"] for r in records],
+        "e2e_ms": e2e,
+        "transfer_ms": per_cycle(wire_ms),
+        # Re-slicing and dtype conversion are the transformation leg here; MX keeps
+        # them separate, and both are reported separately below as well.
+        "quantization_ms": per_cycle(lambda m: ms(m, "reslice_s", "convert_s")),
+        "reslice_ms": per_cycle(lambda m: ms(m, "reslice_s")),
+        "convert_ms": per_cycle(lambda m: ms(m, "convert_s")),
+        "install_ms": per_cycle(lambda m: ms(m, "install_s")),
+        "accounted_ms": acc,
+        "unattributed_ms": [t - a for t, a in zip(e2e, acc)],
+        "attribution_pct": [100.0 * a / t if t else 0.0 for t, a in zip(e2e, acc)],
         "bytes_planned": bytes_planned,
+        "bytes_received": per_cycle(lambda m: float(m.get("bytes_received", 0))),
+        "extra_wire_bytes": per_cycle(lambda m: float(m.get("extra_wire_bytes", 0))),
+        "wire_gbps": [
+            (b * 8.0 / (w / 1e3) / 1e9) if w > 0 else 0.0
+            for b, w in zip(
+                per_cycle(lambda m: float(m.get("bytes_received", 0))),
+                per_cycle(wire_ms),
+            )
+        ],
+        "fallback": per_cycle(lambda m: float(m.get("fallback", 0))),
+        "converts": per_cycle(lambda m: float(m.get("converts", 0))),
         "selected_modes": [_LOAD_MODE[installer_name]] * len(records),
         "stage_records": records,
     }
@@ -230,6 +277,28 @@ def _crit(rank_lists, key):
     }
 
 
+def _crit_gbps(rank_lists, key):
+    """Fleet-critical throughput, which is the slowest rank rather than the fastest.
+
+    _crit takes the per-cycle max across ranks because for a duration the fleet waits
+    on the slowest rank. Reusing it for a rate inverts the meaning: the max Gbps is
+    the *best* rank, and a refit is not finished until the worst one is. So take the
+    min across ranks per cycle, and label the fields as rates, not milliseconds.
+    """
+    per = [r.get(key) or [] for r in rank_lists]
+    if not any(per):
+        return None
+    n = min(len(x) for x in per)
+    crit = [min(per[r][i] for r in range(len(per))) for i in range(n)]
+    s = sorted(crit)
+    return {
+        "n": len(s),
+        "min_gbps": min(s),
+        "median_gbps": statistics.median(s),
+        "max_gbps": max(s),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="vLLM model to load (bf16 id or fp8 dir)")
@@ -256,8 +325,17 @@ def main() -> int:
     ap.add_argument("--num-trainers", type=int, default=8)
     ap.add_argument(
         "--installers",
-        default="pwal,quantizing_mdl",
-        help="comma-separated installer arms",
+        # Must be keys of _LOAD_MODE. The previous default named an arm
+        # ("quantizing_mdl") that _LOAD_MODE never had, so any run using the default
+        # aborted after completing its cycles -- late enough to have already paid for
+        # the transfers and thrown away the timings.
+        default="pwal,mdl",
+        help=f"comma-separated installer arms, from {sorted(_LOAD_MODE)}",
+    )
+    ap.add_argument(
+        "--trainer-topology",
+        default=None,
+        help="publisher arm as run, e.g. 'Megatron-EP4'; recorded verbatim",
     )
     ap.add_argument("--mx-server", required=True)
     ap.add_argument("--warm-cycles", type=int, default=10)
@@ -269,6 +347,16 @@ def main() -> int:
     args = ap.parse_args()
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    # Validate arm names here rather than inside the worker. The worker-side check
+    # only runs once a cycle starts, so a typo costs a full model load and a real
+    # transfer before it is reported, and reports it as a worker crash.
+    requested = [a for a in (s.strip() for s in args.installers.split(",")) if a]
+    unknown = [a for a in requested if a not in _LOAD_MODE]
+    if unknown:
+        raise SystemExit(
+            f"unknown installer arm(s) {unknown}; expected from {sorted(_LOAD_MODE)}"
+        )
 
     from vllm import LLM
 
@@ -299,7 +387,10 @@ def main() -> int:
         "source_dtype": args.source_dtype,
         "target_dtype": args.dtype,
         "quantization_method": args.quantization,
-        "trainer_topology": f"FSDP{args.num_trainers}+EP{args.num_trainers}",
+        # Recorded verbatim from the launcher: the receiver cannot see which trainer
+        # backend published, and the old hardcoded "FSDP{n}+EP{n}" mislabelled every
+        # Megatron run as FSDP -- exactly the arm confusion the reporting rules forbid.
+        "trainer_topology": args.trainer_topology or f"EP{args.num_trainers}",
         "trainer_gpus": args.num_trainers,
         "inference_topology": (
             f"TP{args.tp}+EP{args.tp}"
@@ -335,12 +426,6 @@ def main() -> int:
         quantization = _crit(refit, "quantization_ms")
         e2e = _crit(refit, "e2e_ms")
         bytes_per_rank = [r["bytes_planned"] for r in refit]
-        total_bytes = sum(bytes_per_rank)
-        aggregate_gbps = None
-        if transfer and transfer["median_ms"] > 0:
-            aggregate_gbps = (
-                total_bytes * 8.0 / (transfer["median_ms"] / 1e3) / 1e9
-            )
         modes = sorted(
             {
                 mode
@@ -348,14 +433,60 @@ def main() -> int:
                 for mode in rank_result.get("selected_modes", [])
             }
         )
+
+        def med(values):
+            ordered = sorted(values)
+            return ordered[len(ordered) // 2] if ordered else 0.0
+
+        # Byte economics per rank, measured rather than predicted. wire minus extra
+        # is the payload the model actually needed; extra is the duplication the
+        # published plan carries.
+        wire_bytes = [med(r.get("bytes_received", [0])) for r in refit]
+        extra_bytes = [med(r.get("extra_wire_bytes", [0])) for r in refit]
+        attribution = [med(r.get("attribution_pct", [0])) for r in refit]
+        # Aggregate rate over the bytes that crossed the wire, against the slowest
+        # rank's wire leg -- that is when the fleet's transfer is actually done.
+        aggregate_gbps = None
+        if transfer and transfer["median_ms"] > 0:
+            aggregate_gbps = (
+                sum(wire_bytes) * 8.0 / (transfer["median_ms"] / 1e3) / 1e9
+            )
         rec["arms"][installer_name] = {
             "selected_modes": modes,
             "bytes_planned_per_rank": bytes_per_rank,
+            "wire_bytes_per_rank": wire_bytes,
+            "extra_wire_bytes_per_rank": extra_bytes,
+            "useful_bytes_per_rank": [
+                w - e for w, e in zip(wire_bytes, extra_bytes)
+            ],
+            "byte_amplification_pct": [
+                100.0 * e / (w - e) if (w - e) > 0 else 0.0
+                for w, e in zip(wire_bytes, extra_bytes)
+            ],
             "aggregate_wire_gbps": aggregate_gbps,
+            "per_rank_wire_gbps": _crit_gbps(refit, "wire_gbps"),
             "transfer": transfer,
             "install": install,
             "quantization": quantization,
+            "reslice": _crit(refit, "reslice_ms"),
+            "convert": _crit(refit, "convert_ms"),
             "e2e": e2e,
+            "accounted": _crit(refit, "accounted_ms"),
+            "unattributed": _crit(refit, "unattributed_ms"),
+            # The reporting rules only accept a breakdown at >=95% attribution or
+            # <=100 ms unattributed, so the row carries its own admissibility.
+            "attribution_pct_per_rank": attribution,
+            "attribution_ok": all(
+                a >= 95.0 for a in attribution
+            ) or all(
+                u <= 100.0
+                for r in refit
+                for u in r.get("unattributed_ms", [])
+            ),
+            "fallback_total": sum(
+                sum(r.get("fallback", [])) for r in refit
+            ),
+            "converts_total": sum(sum(r.get("converts", [])) for r in refit),
         }
         last_arm = installer_name
 

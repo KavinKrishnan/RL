@@ -23,6 +23,7 @@ from nemo_rl.distributed.mx_megatron_helpers import (
     MegatronRoleSpec,
 )
 from nemo_rl.distributed.mx_reshard_publisher import (
+    _gated_mlp_extras,
     PLACEMENT_REPLICATE,
     PLACEMENT_SHARD,
     UnmappedMegatronTensor,
@@ -499,3 +500,53 @@ def test_non_expert_tensors_are_published_by_every_rank():
 
     # 18,432 expert offers + 435 x 8 replicated offers.
     assert sum(len(rank) for rank in owners.values()) == 21912
+
+
+# --------------------------------------------------------- gated MLP fusion order
+# MX assigns the two halves of a fused gate/up parameter to hf_names positionally
+# and refuses to infer which half is which, because getting it wrong publishes the
+# gate's bytes under the up projection's name with every digest agreeing.
+
+
+def test_fused_expert_gate_up_is_stamped_gate_then_up():
+    extras = _gated_mlp_extras(
+        "decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        "expert_column",
+        ("model.layers.0.mlp.experts.0.gate_proj.weight",
+         "model.layers.0.mlp.experts.0.up_proj.weight"),
+    )
+    assert extras == {"gated_mlp_order": "gate_then_up"}
+
+
+def test_dense_gated_mlp_is_stamped_too():
+    extras = _gated_mlp_extras(
+        "decoder.layers.0.mlp.linear_fc1.weight",
+        "gated_mlp_column",
+        ("model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.up_proj.weight"),
+    )
+    assert extras == {"gated_mlp_order": "gate_then_up"}
+
+
+def test_reversed_hf_name_order_is_refused_not_guessed():
+    with pytest.raises(ValueError, match="do not read as"):
+        _gated_mlp_extras(
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0",
+            "expert_column",
+            ("model.layers.0.mlp.experts.0.up_proj.weight",
+             "model.layers.0.mlp.experts.0.gate_proj.weight"),
+        )
+
+
+def test_unfused_roles_are_not_stamped():
+    # linear_fc2 maps to one HF name, so there is nothing to order; stamping it
+    # anyway would assert a layout claim about a tensor that has no halves.
+    assert _gated_mlp_extras(
+        "decoder.layers.0.mlp.experts.linear_fc2.weight0",
+        "expert_row",
+        ("model.layers.0.mlp.experts.0.down_proj.weight",),
+    ) == {}
+    assert _gated_mlp_extras(
+        "decoder.layers.0.self_attention.linear_qkv.weight",
+        "qkv_column",
+        ("q.weight", "k.weight", "v.weight"),
+    ) == {}

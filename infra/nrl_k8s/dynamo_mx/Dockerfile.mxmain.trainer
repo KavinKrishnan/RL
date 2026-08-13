@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Trainer overlay for validating ModelExpress `main`: Megatron publisher side.
+#
+# Base is the nemo-rl image that already carries megatron-core, megatron.bridge
+# and the compiled TransformerEngine extension in its Megatron Ray actor venv, so
+# this overlay only adds NIXL and the MX client at an explicit SHA. Holding the
+# base fixed and moving only MX_REF is what makes the phases an A/B: Phase 1 and 2
+# build at MX `main`, Phase 3 rebuilds the same Dockerfile at the `c2` staging
+# commit, and nothing else in the image moves.
+#
+# Deliberately NOT built on the older v2 overlay Dockerfile in this directory:
+# that one asserts `MxV2TrainingPublisher` at build time, which no longer exists
+# on `main` and is not coming back (its PRs were closed unmerged). The assertion
+# here is inverted for exactly that reason -- see the smoke stage.
+#
+# torch in the base is cu129, so the cu12 NIXL sidecar is the matching wheel.
+# Pointing BASE_IMAGE at a cu13 base means switching to nixl-cu13.
+#
+# No `# syntax=` directive, and build with the `default` (docker driver) builder
+# rather than a docker-container one -- see the receiver overlay's header for both
+# reasons. Needs host binfmt/qemu for arm64 on x86:
+#   docker run --privileged --rm tonistiigi/binfmt --install arm64
+#
+#   docker buildx build --builder default --allow network.host --platform linux/arm64 \
+#     --build-arg MX_REF=89bbb59... \
+#     -t nvcr.io/nvidian/dynamo-dev/nemo-rl:mxmain-<sha8> \
+#     -f infra/nrl_k8s/dynamo_mx/Dockerfile.mxmain.trainer .
+
+ARG BASE_IMAGE=nvcr.io/nvidian/dynamo-dev/nemo-rl:kavink-v2
+FROM ${BASE_IMAGE}
+
+# MX main at the head being validated. Recorded in the phase evidence.
+ARG MX_REF=46da339c9fae4c686a236ee03d2a733698e056e4
+ARG NIXL_VERSION=0.10.1
+# Must stay quoted. An unquoted ARG default ends at the first space, so the PEP 508
+# `modelexpress @ git+https://...` form silently collapses to `modelexpress`, pip
+# then reports the base's copy as already satisfied, and the build succeeds having
+# installed nothing. The base already carries refit/reshard, so no import check can
+# catch that -- which is why the smoke stage below pins the resolved commit instead.
+ARG MX_SPEC="modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git@${MX_REF}#subdirectory=modelexpress_client/python"
+
+USER root
+
+# The publisher runs under torchrun, not Ray, so it needs one venv that has
+# Megatron, TransformerEngine, NIXL and MX together. In this base Megatron and TE
+# live only in the Megatron actor venv, so that is the venv the publisher uses and
+# the one that must gain NIXL and MX.
+#
+# --no-deps on both NIXL wheels and on modelexpress: their declared deps pull the
+# nvidia-cu* stack the base already pins, which is a multi-GB reinstall that can
+# also silently move the CUDA minor out from under TransformerEngine. grpcio and
+# protobuf are layered back explicitly because MX imports them at module scope,
+# and MX's generated p2p_pb2 needs a protobuf runtime at least as new as its
+# gencode.
+#
+# --force-reinstall on modelexpress only: the base ships its own 0.5.0 and the
+# overlay's version string is also 0.5.0, so without it pip can leave the old tree
+# in place. NIXL is installed separately precisely so it stays out of the forced
+# reinstall.
+#
+# --network=host on every step that resolves a hostname. On this build host the
+# corporate nameservers are reachable only from the host netns, so a build sandbox
+# on the docker bridge gets the right resolv.conf and still cannot resolve pypi.org
+# or github.com. Requires `--allow network.host` on the buildx invocation.
+RUN --network=host set -eux; \
+    for venv in /opt/ray_venvs/*megatron*/ ; do \
+      [ -d "$venv" ] || continue; \
+      echo "[overlay] installing MX ${MX_REF} into ${venv}"; \
+      "${venv}bin/pip" install --no-cache-dir --no-deps \
+        "nixl==${NIXL_VERSION}" "nixl-cu12==${NIXL_VERSION}"; \
+      "${venv}bin/pip" install --no-cache-dir --no-deps --force-reinstall "${MX_SPEC}"; \
+      "${venv}bin/pip" install --no-cache-dir "grpcio>=1.66.2" "protobuf>=6.31,<7"; \
+    done
+
+# The driver venv gets MX too, so a helper script run outside the actor venv can
+# still import the client. No NIXL here: nothing in the driver registers memory.
+RUN --network=host /opt/nemo_rl_venv/bin/pip install --no-cache-dir --no-deps --force-reinstall "${MX_SPEC}" \
+ && /opt/nemo_rl_venv/bin/pip install --no-cache-dir "grpcio>=1.66.2" "protobuf>=6.31,<7"
+
+# Smoke: fail the build if the seam this overlay exists to exercise is absent, or
+# if the v2 client survived the swap. The second half matters as much as the
+# first: pip installing over an existing modelexpress can leave stale modules
+# behind, and a lingering nemo_rl_v2 would let a publisher silently take the v2
+# path and invalidate the whole comparison.
+RUN set -eux; \
+    V=$(ls -d /opt/ray_venvs/*megatron*/ | head -1); \
+    "${V}bin/python" -c "\
+import modelexpress, importlib.metadata as md; \
+from modelexpress.refit.reshard.rendezvous import MxReshardRendezvous, wrap_rendezvous_blob, unwrap_rendezvous_blob; \
+from modelexpress.refit.reshard.megatron_publisher import publish_registered_shard_table, publish_megatron_reshard_view; \
+from modelexpress.refit.reshard.megatron_aliases import MegatronAliasInput, build_hf_aliases; \
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing; \
+from modelexpress import envs; \
+import megatron.core, megatron.bridge, transformer_engine.pytorch; \
+import nixl._api; \
+print('trainer overlay: MX', md.version('modelexpress'), 'reshard seam OK'); \
+"; \
+    MX_REF="${MX_REF}" "${V}bin/python" - <<'PY'
+import importlib
+import importlib.metadata as md
+import json
+import os
+
+# The load-bearing check. Every other assertion in this file passes just as well
+# against the base image's own MX, because the base is a branch that already had
+# refit/reshard. Only the recorded direct_url proves the layer above actually
+# fetched the commit this overlay claims to be built at.
+want = os.environ["MX_REF"]
+raw = md.distribution("modelexpress").read_text("direct_url.json")
+if raw is None:
+    raise SystemExit(
+        "modelexpress has no direct_url.json: it came from an index or was never "
+        f"reinstalled, so this image is not MX {want[:8]}"
+    )
+info = json.loads(raw)
+got = info.get("vcs_info", {}).get("commit_id", "")
+if got != want:
+    raise SystemExit(f"MX commit mismatch: image has {got[:12] or '<none>'}, expected {want[:12]}")
+
+for gone in ("modelexpress.nemo_rl_v2", "modelexpress.training_publisher", "modelexpress.refit_receiver"):
+    try:
+        importlib.import_module(gone)
+    except ImportError:
+        continue
+    raise SystemExit(f"{gone} is still importable: the v2 client was not replaced")
+
+import modelexpress
+
+for attr in ("MxV2TrainingPublisher", "MxV2RefitReceiver", "TrainerWorldLayout"):
+    if hasattr(modelexpress, attr):
+        raise SystemExit(f"modelexpress.{attr} still exported: stale v2 install")
+
+print(f"trainer overlay: MX pinned at {got[:12]}, v2 surface absent as expected")
+PY
