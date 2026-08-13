@@ -49,7 +49,13 @@ MX_URL = os.environ.get(
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "7200")) + LOCAL_RANK
 READY_FILE = os.environ.get("READY_FILE")
 STOP_FILE = os.environ.get("STOP_FILE")
-HOLD_S = int(os.environ.get("HOLD_S", "2400"))
+# How long to hold the registered arenas after publishing. Zero or negative means
+# hold until STOP_FILE appears, which is what a multi-run campaign needs: a finite
+# hold silently ends the run mid-campaign, and because the ranks then exit within
+# seconds of each other, the ones still alive see the rendezvous TCPStore drop and
+# SIGABRT. The result reads as a publisher crash in the log while the actual cause
+# was the timer expiring, and the receiver it abandoned simply hangs in handshake.
+HOLD_S = int(os.environ.get("HOLD_S", "0"))
 
 _NVIS = torch.cuda.device_count()
 DEV_ID = LOCAL_RANK % _NVIS
@@ -262,12 +268,24 @@ try:
     # No collective after publishing: ranks publish independently and the
     # receiver discovers them all from the MX server, so a barrier here only
     # risks tearing ranks down while they must stay alive holding their agents.
-    deadline = time.time() + HOLD_S
-    while time.time() < deadline:
+    deadline = None if HOLD_S <= 0 else time.time() + HOLD_S
+    while deadline is None or time.time() < deadline:
         if STOP_FILE and os.path.exists(STOP_FILE):
             print(f"[pub r{RANK}] stop file seen", flush=True)
             break
         time.sleep(2)
+    if deadline is not None and time.time() >= deadline:
+        print(
+            f"[pub r{RANK}] HOLD_S={HOLD_S}s elapsed; exiting while a receiver may "
+            f"still need these sources",
+            flush=True,
+        )
 finally:
     rendezvous.close()
     print(f"[pub r{RANK}] rendezvous closed, source marked stale", flush=True)
+    # Tear the process group down before exiting. Ranks leave within seconds of each
+    # other, and a rank that is still in its shutdown path treats the rendezvous
+    # store disappearing as a fatal error and aborts, which buries the real reason
+    # for the exit under pages of SIGABRT frames on every other rank.
+    if dist.is_initialized():
+        dist.destroy_process_group()

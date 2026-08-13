@@ -110,6 +110,7 @@ cmd_publish8() {
       rm -f /tmp/pub.ready.r* /tmp/pub.stop /tmp/pub.log
       cd /tmp
       nohup env MODEL_EXPRESS_URL=$MXSERVER READY_FILE=/tmp/pub.ready \
+        STOP_FILE=/tmp/pub.stop HOLD_S=0 \
         $py -m torch.distributed.run \
           --nnodes=2 --node_rank=$node --nproc_per_node=4 \
           --master_addr=$master --master_port=29500 \
@@ -127,26 +128,66 @@ cmd_publog() {
   done
 }
 
+# Called before every refit. A publisher that has exited leaves the receiver hanging
+# in handshake for the full 900s rendezvous timeout with nothing in its log to say
+# why, so it is cheaper to check here than to diagnose there.
+require_publishers() {
+  local alive
+  for pod in $PUB0 $PUB1; do
+    alive=$(k exec "$pod" -- bash -lc 'pgrep -fc "/tmp/ep_publisher_reshard.py" || true' | tr -d '\r')
+    if [[ "${alive:-0}" -lt 4 ]]; then
+      echo "$pod has $alive publisher rank(s), expected 4; re-run '$0 publish8'" >&2
+      exit 1
+    fi
+  done
+  echo "publishers healthy: 4 ranks on each of $PUB0 and $PUB1"
+}
+
+cmd_stoppub() {
+  for pod in $PUB0 $PUB1; do
+    k exec "$pod" -- bash -lc 'touch /tmp/pub.stop; echo "stop requested on $(hostname)"'
+  done
+}
+
 # Gate 3 and 4 differ only in cycle count and which checks gate the row, so they
 # share one runner. num_trainers is 8 because the receiver plans against 8 sources.
 run_refit() {
   local pod=$1 py=$2 out=$3 cycles=$4
   shift 4
   need_pod "$pod"
+  require_publishers
   # The log is named after the output, not reused as /tmp/recv.log. The stage records
   # MX emits at WARNING are only in the log, so overwriting it discards the raw
   # evidence for the previous gate -- which is exactly what happened to gate 3.
   local log="/tmp/recv.${out%.json}.log"
+  # 1600 Gbps is this node's whole fabric: 4 x 400 Gbps RoCE rails, all four ACTIVE
+  # and visible in the pod, with UCX_NET_DEVICES listing all of them. The ceiling is
+  # per rank and must be what one rank could physically reach, which is all rails when
+  # the other rank is not transferring -- not the node total divided by ranks. The
+  # earlier 800 was that division, and it aborted six refits that were merely faster
+  # than an assumption about fair sharing. The guard is for impossible rates, not
+  # unfair ones; whether the bytes truly landed is settled by parameter equality --
+  # and it was: 1156 Gbps peak per rank with 435/435 params byte-exact, aggregate
+  # 1499 Gbps against the 1600 the fabric provides. See 07_GATE5.
+  # Runs in the FOREGROUND of the exec, and the caller backgrounds this script if it
+  # wants to. Do not go back to backgrounding inside the pod: when the exec session
+  # closes, the container tears down the process group, and it can win the race
+  # against the child even opening its log. The observable result is the previous
+  # run's log still sitting there, unchanged, while the driver reports a successful
+  # launch -- which cost far more time to disbelieve than the run itself takes.
+  # setsid escapes that teardown but cannot be verified with $!, since setsid exits
+  # as soon as it has re-parented the child, so every healthy launch looks dead.
+  # Holding the session open avoids both problems and streams the log live.
+  echo "refit running in foreground -> $out (pod log $log); ~4 min at 10 cycles"
   k exec "$pod" -- bash -lc "
-    nohup env MX_POOL_REG=1 MX_RESHARD_MAX_GBPS=800 MX_REFIT_STAGE_RECORD=1 $* \
+    env MX_POOL_REG=1 MX_RESHARD_MAX_GBPS=1600 MX_REFIT_STAGE_RECORD=1 $* \
       $py /tmp/reshard_receiver_run.py \
       --model $MODEL --rendezvous-name $MODEL \
       --tp 2 --num-trainers 8 --installers pwal,mdl \
       --trainer-topology Megatron-EP8 \
       --mx-server $MXSERVER \
       --warm-cycles $cycles \
-      --out $OUTDIR/$out > $log 2>&1 &
-    echo 'refit launched -> $out (log $log)'"
+      --out $OUTDIR/$out 2>&1 | tee $log"
 }
 
 cmd_gate3() { run_refit $RECV_MAIN $RECVPY gate3_ep8_tp2_correctness.json 3; }
