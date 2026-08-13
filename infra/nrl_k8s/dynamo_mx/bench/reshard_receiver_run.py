@@ -155,6 +155,15 @@ def w_refit_timed(worker, n, installer_name):
     e2e = totals
     acc = per_cycle(accounted_ms)
     bytes_planned = recv._plan.bytes_planned() if recv._plan is not None else 0
+    # What this rank's parameters actually occupy. This is the honest denominator for
+    # amplification: MX's extra_wire_bytes counts only the duplication it attributes
+    # to replicated offers, so wire minus extra is not "the bytes the model needed" --
+    # a full-pulled source that is sliced locally moves bytes that are discarded and
+    # are not counted as extra. Measuring the engine's own footprint separates the two.
+    engine_param_bytes = sum(
+        p.numel() * p.element_size()
+        for p in worker.model_runner.model.parameters()
+    )
     return {
         "e2e_ms": e2e,
         "transfer_ms": per_cycle(wire_ms),
@@ -168,6 +177,7 @@ def w_refit_timed(worker, n, installer_name):
         "unattributed_ms": [t - a for t, a in zip(e2e, acc)],
         "attribution_pct": [100.0 * a / t if t else 0.0 for t, a in zip(e2e, acc)],
         "bytes_planned": bytes_planned,
+        "engine_param_bytes": engine_param_bytes,
         "bytes_received": per_cycle(lambda m: float(m.get("bytes_received", 0))),
         "extra_wire_bytes": per_cycle(lambda m: float(m.get("extra_wire_bytes", 0))),
         "wire_gbps": [
@@ -455,13 +465,27 @@ def main() -> int:
             "selected_modes": modes,
             "bytes_planned_per_rank": bytes_per_rank,
             "wire_bytes_per_rank": wire_bytes,
+            # MX's own duplication figure: bytes attributed to replicated offers.
             "extra_wire_bytes_per_rank": extra_bytes,
-            "useful_bytes_per_rank": [
+            "wire_minus_reported_extra_per_rank": [
                 w - e for w, e in zip(wire_bytes, extra_bytes)
             ],
-            "byte_amplification_pct": [
+            # What the rank's parameters occupy, which is the floor a perfect refit
+            # would move. Amplification is measured against this rather than against
+            # wire minus extra, because full-pulled sources move bytes that are
+            # sliced away and are not counted in extra_wire_bytes.
+            "engine_param_bytes_per_rank": [
+                r.get("engine_param_bytes", 0) for r in refit
+            ],
+            "amplification_vs_reported_extra_pct": [
                 100.0 * e / (w - e) if (w - e) > 0 else 0.0
                 for w, e in zip(wire_bytes, extra_bytes)
+            ],
+            "amplification_vs_engine_pct": [
+                100.0 * (w - n) / n if n > 0 else 0.0
+                for w, n in zip(
+                    wire_bytes, [r.get("engine_param_bytes", 0) for r in refit]
+                )
             ],
             "aggregate_wire_gbps": aggregate_gbps,
             "per_rank_wire_gbps": _crit_gbps(refit, "wire_gbps"),
@@ -487,6 +511,16 @@ def main() -> int:
                 sum(r.get("fallback", [])) for r in refit
             ),
             "converts_total": sum(sum(r.get("converts", [])) for r in refit),
+            # MX's own per-cycle metrics, verbatim and per rank. The aggregates above
+            # are derived from these, and the byte-accounting categories MX reports
+            # (full_pull_sources, unbounded_sources, descriptor_savings, segments)
+            # are not all represented in them. Without this the JSON cannot answer a
+            # question that was not anticipated when the aggregates were chosen, and
+            # the run has to be repeated to ask it.
+            "mx_metrics_per_rank": [
+                [record["mx"] for record in r.get("stage_records", [])]
+                for r in refit
+            ],
         }
         last_arm = installer_name
 

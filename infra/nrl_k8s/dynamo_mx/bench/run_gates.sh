@@ -43,7 +43,8 @@ RECVPY=/opt/dynamo/venv/bin/python
 pubpy() {
   local pod=$1
   k exec "$pod" -- bash -lc '
-    for py in /opt/ray_venvs/*MegatronPolicyWorker/bin/python \
+    for py in /opt/ray_venvs/*MegatronPolicyWorker/bin/python3 \
+              /opt/ray_venvs/*MegatronPolicyWorker/bin/python \
               /opt/nemo_rl_venv/bin/python /usr/bin/python3; do
       [ -x "$py" ] || continue
       if "$py" -c "import megatron.bridge, modelexpress" >/dev/null 2>&1; then
@@ -132,8 +133,11 @@ run_refit() {
   local pod=$1 py=$2 out=$3 cycles=$4
   shift 4
   need_pod "$pod"
+  # The log is named after the output, not reused as /tmp/recv.log. The stage records
+  # MX emits at WARNING are only in the log, so overwriting it discards the raw
+  # evidence for the previous gate -- which is exactly what happened to gate 3.
+  local log="/tmp/recv.${out%.json}.log"
   k exec "$pod" -- bash -lc "
-    rm -f /tmp/recv.log
     nohup env MX_POOL_REG=1 MX_RESHARD_MAX_GBPS=800 MX_REFIT_STAGE_RECORD=1 $* \
       $py /tmp/reshard_receiver_run.py \
       --model $MODEL --rendezvous-name $MODEL \
@@ -141,8 +145,8 @@ run_refit() {
       --trainer-topology Megatron-EP8 \
       --mx-server $MXSERVER \
       --warm-cycles $cycles \
-      --out $OUTDIR/$out > /tmp/recv.log 2>&1 &
-    echo 'refit launched -> $out'"
+      --out $OUTDIR/$out > $log 2>&1 &
+    echo 'refit launched -> $out (log $log)'"
 }
 
 cmd_gate3() { run_refit $RECV_MAIN $RECVPY gate3_ep8_tp2_correctness.json 3; }
@@ -167,20 +171,27 @@ cmd_gate5() {
 
 cmd_recvlog() {
   local pod=${1:-$RECV_MAIN}
-  k exec "$pod" -- bash -lc 'tail -40 /tmp/recv.log'
+  k exec "$pod" -- bash -lc 'tail -40 $(ls -t /tmp/recv.*.log 2>/dev/null | head -1)'
 }
 
 cmd_collect() {
   mkdir -p "$EVIDENCE"
-  for f in $(k exec $RECV_MAIN -- bash -lc "ls -1 $OUTDIR/*.json 2>/dev/null" | tr -d '\r'); do
-    k cp "$RECV_MAIN:$f" "$EVIDENCE/$(basename "$f")" 2>/dev/null || true
+  # Both receivers write to the same shared PVC path, so list from each: a gate 5
+  # result exists only on the staging receiver's view of it if the main one is gone.
+  for pod in $RECV_MAIN $RECV_STAGING; do
+    for f in $(k exec "$pod" -- bash -lc "ls -1 $OUTDIR/*.json 2>/dev/null" | tr -d '\r'); do
+      k cp "$pod:$f" "$EVIDENCE/$(basename "$f")" 2>/dev/null || true
+    done
   done
-  # Raw logs travel with the JSON: a row without its log cannot be re-read later.
+  # Raw logs travel with the JSON: a row without its log cannot be re-read later, and
+  # the MX_REFIT_STAGE records are only in the log.
   for pod in $PUB0 $PUB1; do
     k exec "$pod" -- bash -lc 'cat /tmp/pub.log' > "$EVIDENCE/${pod}.pub.log" 2>/dev/null || true
   done
   for pod in $RECV_MAIN $RECV_STAGING; do
-    k exec "$pod" -- bash -lc 'cat /tmp/recv.log' > "$EVIDENCE/${pod}.recv.log" 2>/dev/null || true
+    for log in $(k exec "$pod" -- bash -lc 'ls -1 /tmp/recv.*.log 2>/dev/null' | tr -d '\r'); do
+      k exec "$pod" -- bash -lc "cat $log" > "$EVIDENCE/${pod}.$(basename "$log")" 2>/dev/null || true
+    done
   done
   ls -la "$EVIDENCE"
   python3 "$EVIDENCE/report.py" "$EVIDENCE"/*.json
