@@ -454,11 +454,17 @@ def main() -> int:
         wire_bytes = [med(r.get("bytes_received", [0])) for r in refit]
         extra_bytes = [med(r.get("extra_wire_bytes", [0])) for r in refit]
         attribution = [med(r.get("attribution_pct", [0])) for r in refit]
-        # Aggregate rate over the bytes that crossed the wire, against the slowest
-        # rank's wire leg -- that is when the fleet's transfer is actually done.
-        aggregate_gbps = None
+        # An UPPER BOUND on fleet rate, not a measurement, and named so. Dividing the
+        # sum of both ranks' bytes by a median wire duration silently assumes the ranks
+        # transferred in the same wall-clock window. They do not: the ranks are driven
+        # by separate collective_rpc calls and their wire legs stagger. Reported as a
+        # measurement this produced 2463 Gbps on a node whose fabric is 1600 Gbps,
+        # which reads as a transport fault and is really just this arithmetic. Per-rank
+        # rates below are sound -- each divides one rank's bytes by that rank's own
+        # duration -- and the honest fleet number needs timestamps we do not collect.
+        aggregate_upper_bound_gbps = None
         if transfer and transfer["median_ms"] > 0:
-            aggregate_gbps = (
+            aggregate_upper_bound_gbps = (
                 sum(wire_bytes) * 8.0 / (transfer["median_ms"] / 1e3) / 1e9
             )
         rec["arms"][installer_name] = {
@@ -487,7 +493,8 @@ def main() -> int:
                     wire_bytes, [r.get("engine_param_bytes", 0) for r in refit]
                 )
             ],
-            "aggregate_wire_gbps": aggregate_gbps,
+            "aggregate_wire_gbps_upper_bound": aggregate_upper_bound_gbps,
+            "node_fabric_gbps": 1600.0,
             "per_rank_wire_gbps": _crit_gbps(refit, "wire_gbps"),
             "transfer": transfer,
             "install": install,
