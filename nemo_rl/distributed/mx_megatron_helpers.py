@@ -52,12 +52,15 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 if TYPE_CHECKING:
     import torch
 
 logger = logging.getLogger("nemo_rl.distributed.mx_megatron_helpers")
+
+QkvGeometry = tuple[int, int, int]
+QkvGeometryResolver = Callable[[str, Any, Any], QkvGeometry | None]
 
 
 # Match ModelExpress's main-native Megatron alias role vocabulary.
@@ -370,6 +373,7 @@ def detect_megatron_role(
     num_attention_heads: int | None = None,
     num_kv_heads: int | None = None,
     head_dim: int | None = None,
+    qkv_geometry: QkvGeometry | None = None,
     expert_pattern: str | None = None,
     role_overrides: dict[str, str] | None = None,
 ) -> MegatronRoleSpec:
@@ -389,11 +393,11 @@ def detect_megatron_role(
         model: the root model module; used to walk attributes for the
             enclosing module's class.
         tp_size, ep_size, ep_rank: from ``parallel_state``.
-        num_attention_heads, num_kv_heads, head_dim: required for
-            ``qkv_column`` role; derived from the model config. Pass
-            ``None`` if unknown — the role still classifies but the
-            descriptor will be missing fields and the receiver will
-            fall back to its default un-interleave assumptions.
+        num_attention_heads, num_kv_heads, head_dim: model-wide compatibility
+            fallback for ``qkv_column`` metadata.
+        qkv_geometry: optional per-tensor ``(global query heads, global KV
+            heads, head dimension)``. This takes precedence over model-wide
+            values and is required for heterogeneous attention.
         expert_pattern: substring marker for MoE expert tensors; defaults to
             ``"experts"`` and can be overridden with
             ``NRL_MX_EXPERT_TENSOR_PATTERN``.
@@ -495,12 +499,42 @@ def detect_megatron_role(
     if parallelism == "column":
         if _is_fused_qkv_name(name):
             extras: dict[str, str] = {"qkv_interleave": "by_head"}
-            if num_attention_heads is not None and tp_size > 0:
-                extras["num_heads_local"] = str(num_attention_heads // tp_size)
-            if num_kv_heads is not None and tp_size > 0:
-                extras["num_kv_heads_local"] = str(num_kv_heads // tp_size)
-            if head_dim is not None:
-                extras["head_dim"] = str(head_dim)
+            if qkv_geometry is not None:
+                num_attention_heads, num_kv_heads, head_dim = qkv_geometry
+            if (
+                num_attention_heads is not None
+                and num_kv_heads is not None
+                and head_dim is not None
+            ):
+                q_heads = int(num_attention_heads)
+                kv_heads = int(num_kv_heads)
+                qkv_head_dim = int(head_dim)
+                if (
+                    q_heads < 1
+                    or kv_heads < 1
+                    or qkv_head_dim < 1
+                    or q_heads % kv_heads
+                ):
+                    raise ValueError(
+                        f"{name}: invalid global Q/KV geometry "
+                        f"{(q_heads, kv_heads, qkv_head_dim)}"
+                    )
+                extras.update(
+                    {
+                        "num_heads": str(q_heads),
+                        "num_kv_heads": str(kv_heads),
+                        "head_dim": str(qkv_head_dim),
+                    }
+                )
+                # Preserve old-client compatibility only where local head
+                # counts are meaningful. New MX prefers the global fields.
+                if (
+                    tp_size > 0
+                    and q_heads % tp_size == 0
+                    and kv_heads % tp_size == 0
+                ):
+                    extras["num_heads_local"] = str(q_heads // tp_size)
+                    extras["num_kv_heads_local"] = str(kv_heads // tp_size)
             return MegatronRoleSpec(role=ROLE_QKV_COLUMN, descriptor_extras=extras)
         if _is_fused_gated_mlp_name(name):
             return MegatronRoleSpec(
@@ -537,6 +571,7 @@ def collect_megatron_publish_set(
     num_attention_heads: int | None = None,
     num_kv_heads: int | None = None,
     head_dim: int | None = None,
+    qkv_geometry_resolver: QkvGeometryResolver | None = None,
     expert_pattern: str | None = None,
     role_overrides: dict[str, str] | None = None,
     target_dtype: "torch.dtype | None" = None,
@@ -583,6 +618,11 @@ def collect_megatron_publish_set(
             raw_name[len("module.") :] if raw_name.startswith("module.") else raw_name
         )
 
+        qkv_geometry = (
+            qkv_geometry_resolver(raw_name, param, model)
+            if qkv_geometry_resolver is not None
+            else None
+        )
         spec = detect_megatron_role(
             raw_name,
             param,
@@ -594,6 +634,7 @@ def collect_megatron_publish_set(
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            qkv_geometry=qkv_geometry,
             expert_pattern=expert_pattern,
             role_overrides=role_overrides,
         )
@@ -633,6 +674,8 @@ __all__ = [
     "ROLE_REPLICATED",
     "ROLE_ROW",
     "ROLE_VOCAB_PARALLEL",
+    "QkvGeometry",
+    "QkvGeometryResolver",
     "canonicalize_grouped_expert_name",
     "collect_megatron_publish_set",
     "detect_megatron_role",

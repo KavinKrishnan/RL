@@ -219,13 +219,17 @@ def test_non_strict_resolver_reports_no_names_and_the_tensor_is_dropped():
 
 
 def test_qkv_head_extras_survive_translation():
-    """build_hf_aliases reads head_dim / num_heads_local / num_kv_heads_local off
-    extras, and raises a KeyError if the publisher dropped them."""
+    """Global Q/KV geometry survives the adapter without being renamed."""
     entry = _entry(
         "decoder.layers.0.self_attention.linear_qkv.weight",
-        torch.zeros(1280, 2048),
+        torch.zeros(1536, 2048),
         ROLE_QKV_COLUMN,
-        extras={"head_dim": "128", "num_heads_local": "8", "num_kv_heads_local": "2"},
+        extras={
+            "qkv_interleave": "by_head",
+            "head_dim": "128",
+            "num_heads": "8",
+            "num_kv_heads": "2",
+        },
     )
     resolver = make_bridge_resolver(
         {
@@ -240,8 +244,8 @@ def test_qkv_head_extras_survive_translation():
     (item,) = build_megatron_alias_inputs([entry], resolve_hf_names=resolver, tp_size=1, tp_rank=0)
 
     assert item.extras["head_dim"] == "128"
-    assert item.extras["num_heads_local"] == "8"
-    assert item.extras["num_kv_heads_local"] == "2"
+    assert item.extras["num_heads"] == "8"
+    assert item.extras["num_kv_heads"] == "2"
     assert len(item.hf_names) == 3
 
 
@@ -321,6 +325,53 @@ def test_translated_items_are_accepted_by_build_hf_aliases():
         assert tensor.shards
         for shard in tensor.shards:
             assert shard.agent_name == "trainer-r0"
+
+
+def test_kv_below_tp_descriptor_is_consumed_by_interval_alias_builder():
+    """The RL and MX contracts agree when most TP ranks own no K/V rows."""
+    from modelexpress.refit.reshard.megatron_aliases import build_hf_aliases
+
+    name = "decoder.layers.0.self_attention.linear_qkv.weight"
+    extras = {
+        "qkv_interleave": "by_head",
+        "head_dim": "128",
+        "num_heads": "64",
+        "num_kv_heads": "2",
+    }
+    resolver = make_bridge_resolver(
+        {
+            name: [
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+            ]
+        }
+    )
+
+    names_by_rank = {}
+    for rank in range(8):
+        local = torch.zeros(1088, 16, dtype=torch.bfloat16)
+        entry = _entry(name, local, ROLE_QKV_COLUMN, extras=extras)
+        (item,) = build_megatron_alias_inputs(
+            [entry],
+            resolve_hf_names=resolver,
+            tp_size=8,
+            tp_rank=rank,
+        )
+        published = build_hf_aliases([item], agent_name=f"trainer-r{rank}")
+
+        assert item.global_shape == (8704, 16)
+        assert item.local_shard_range == (rank * 1088, (rank + 1) * 1088)
+        assert published_byte_count(published) == local.numel() * local.element_size()
+        names_by_rank[rank] = {tensor.name for tensor in published}
+
+    assert names_by_rank[0] == {"model.layers.0.self_attn.q_proj.weight"}
+    assert names_by_rank[3] == {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    }
+    assert names_by_rank[7] == names_by_rank[3]
 
 
 def test_published_byte_count_sums_shard_boxes():
