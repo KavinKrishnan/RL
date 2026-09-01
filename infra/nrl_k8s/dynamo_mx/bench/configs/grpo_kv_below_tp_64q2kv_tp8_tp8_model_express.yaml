@@ -1,0 +1,135 @@
+# The KV-heads-below-TP arm. This is the only recipe here that reproduces the
+# geometry from the Nemotron Ultra report: 64 query heads, 2 KV heads, trainer
+# TP8, receiver vLLM TP8.
+#
+# Why no existing recipe covers it. Qwen3-30B-A3B is Q=32, KV=4 at trainer TP2,
+# and Qwen3-4B is Q=32, KV=8 at TP2. Both have KV >= TP, so every rank owns at
+# least one whole KV head and the sparse case -- a rank that owns Q rows but no K
+# or V rows at all -- never arises. Those recipes therefore exercise the global
+# interval arithmetic but not the branch that motivated it.
+#
+# What breaks at KV < TP. The fused QKV output is
+# query_projection_size + 2 * kv_projection_size = 8192 + 2*256 = 8704 rows
+# (Megatron attention.py, linear_qkv_out_dim), column-parallel over TP8, so each
+# rank owns 1088 contiguous raw rows. 1088 / 128 = 8.5, so shard boundaries do
+# not fall on head boundaries and a rank can hold a partial head. Grouping is
+# [32 Q, 1 K, 1 V] per KV group, 4352 rows per group, so ranks 0-3 together form
+# group 0 and ranks 4-7 form group 1. K and V rows land entirely inside the
+# shards of rank 3 and rank 7; the other six ranks publish Q only.
+#
+# The legacy path could not express this. It asked the publisher for
+# num_kv_heads_local, which is 2 // 8 = 0, and then either divided by zero or
+# rejected the geometry outright. The publisher now emits global per-layer
+# num_heads / num_kv_heads / head_dim and withholds the local counts when they
+# would not divide, and MX maps each rank's raw row interval through the global
+# interleave and merges the sparse per-rank offers into complete HF tensors.
+#
+# The model is reduced, not Nemotron Ultra. Attention geometry is preserved
+# exactly, because that is all the row arithmetic depends on; layer count, MLP
+# width and vocabulary are shrunk so the arm fits in 16 GPUs. Weights are random.
+# That does not weaken the test: the question is whether each rank's row interval
+# lands in the right place in vLLM's q/k/v, and a misplaced row makes vLLM's
+# logprobs disagree with Megatron's on identical weights, which
+# token_mult_prob_error measures directly. See
+# evidence/32_kv_below_tp/build_reduced_gqa_model.py.
+#
+# Not a performance row. Do not quote timings: the model is tiny and the TP8
+# groups span two 4-GPU nodes, so the transport is crossing the fabric for a
+# geometry no production run would use.
+
+defaults: ../../../../../examples/configs/grpo_math_1B_megatron.yaml
+
+grpo:
+  # One cold refit plus three warm ones. Enough to show the sparse merge is
+  # stable across refits rather than accidentally right once.
+  max_num_steps: 4
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: /mnt/rl-workspace/kavink/models/qwen3-64q2kv-4L
+  tokenizer:
+    name: /mnt/rl-workspace/kavink/models/qwen3-64q2kv-4L
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    # TP8 is the point of the arm: it is what makes KV(2) < TP.
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    empty_unused_memory_level: 1
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      # Each node holds an address on all four RDMA rails and NCCL was pairing a
+      # local rail-0 HCA against a peer's rail-3 address, which are different
+      # subnets, so the QP died with IBV_WC_RETRY_EXC_ERR. Forbid rail crossing.
+      NCCL_CROSS_NIC: "0"
+
+  generation:
+    backend: vllm
+    # Long enough that a mis-mapped K or V row shows up as a logprob
+    # disagreement rather than hiding in a handful of tokens.
+    max_new_tokens: 128
+    temperature: 1.0
+    top_p: 1.0
+    refit_transport: model_express
+    vllm_cfg:
+      async_engine: false
+      # vLLM must replicate the 2 KV heads across 8 ranks, which is the receiver
+      # half of the reported topology.
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      # TP8 spans two 4-GPU nodes here, which no earlier arm did: every prior
+      # recipe ran vLLM TP4 inside a single node. Both of vLLM's fast all-reduce
+      # paths assume intra-node peer access and hang during init on this topology
+      # with NCCL_P2P_DISABLE=1 -- one rank blocks in CustomAllreduce.__init__ ->
+      # in_the_same_node_as, another in the symmetric-memory rendezvous. Set on
+      # vllm_cfg rather than the entrypoint because the driver's exports do not
+      # reach the Ray actors; vllm_generation propagates this map to the
+      # non-leader workers too.
+      env_vars:
+        VLLM_ALLREDUCE_USE_SYMM_MEM: "0"
+    # The custom all-reduce half is a ParallelConfig field, not an env var.
+    vllm_kwargs:
+      disable_custom_all_reduce: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+
+data:
+  max_input_seq_length: 1024
+
+logger:
+  # Node-local: the shared PVC is at 100% and this run must not depend on it
+  # having free space. Copy the evidence off the pod afterwards.
+  log_dir: /tmp/mx-reshard-kv-below-tp
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+
+checkpointing:
+  enabled: false
