@@ -268,6 +268,10 @@ class VllmInternalWorkerExtension:
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
     _model_express: ModelExpressGeneratorClient | None = None
+    # Counts installs rather than training steps: MX_REFIT_VERIFY only needs to
+    # know which one is first, because that is the refit whose passing outcome is
+    # "nothing changed".
+    _mx_refit_count: int = 0
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -301,11 +305,28 @@ class VllmInternalWorkerExtension:
         """Stage, verify, and install an exact MX version at a safe point."""
         if self._model_express is None:
             raise RuntimeError("ModelExpress generator client is not initialized")
+        from nemo_rl.distributed import mx_refit_verify
+
+        model = self.model_runner.model
+        verifying = mx_refit_verify.enabled()
         staged = self._model_express.stage_weight(version=version)
         try:
+            # Fingerprint after staging so the window covers only the mutation.
+            before = mx_refit_verify.fingerprint_model(model) if verifying else {}
             self._model_express.apply_weight(staged)
         finally:
             staged.release()
+
+        self._mx_refit_count += 1
+        if verifying and before:
+            mx_refit_verify.report(
+                self._mx_refit_count,
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0,
+                before,
+                mx_refit_verify.fingerprint_model(model),
+            )
         return True
 
     def _load_full_hf_weights(
