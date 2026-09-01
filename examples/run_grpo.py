@@ -258,10 +258,22 @@ def main() -> None:
                     )
         finally:
             shutdown_environments(task_to_env, val_task_to_env)
+            # Order matters, and so does getting here at all. The generation
+            # ranks hold the remote side of the trainers' NIXL connections, so
+            # they must disconnect before the trainers destroy their local UCX
+            # workers; reversing this can abort in ucp_worker_destroy. And the
+            # trainer teardown cannot be left to Python finalizers: by then Ray
+            # may already be finalizing its core worker, and a destructor that
+            # issues an RPC can re-initialize it and abort the driver. Each
+            # teardown is guarded so a failure in one still lets the other run.
             try:
                 policy_generation.shutdown()
             except Exception as error:
                 print(f"Error shutting down generation: {error}", flush=True)
+            try:
+                policy.shutdown()
+            except Exception as error:
+                print(f"Error shutting down policy: {error}", flush=True)
     finally:
         # Flush on the failure paths too, and before cluster teardown: the OTel
         # SDK's own atexit hook is registered ahead of Ray's and so runs after
