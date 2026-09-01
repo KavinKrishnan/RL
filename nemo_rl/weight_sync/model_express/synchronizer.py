@@ -107,17 +107,35 @@ class ModelExpressWeightSynchronizer(WeightSynchronizer):
             if timer is not None
             else nullcontext()
         )
+
+        def phase(name: str):
+            """Split the refit into its two serialized halves.
+
+            Publish and receive are strictly sequential, so both sit on the
+            critical path, but only the receive half reports MX_REFIT_STAGE
+            telemetry. Without this split the publish cost is invisible: on
+            Qwen3-30B-A3B it is roughly 8.4 s of an 11 s refit, far larger than
+            the transfer MX does report, while on a dense 4B model it is only
+            ~0.5 s. Attributing a refit therefore needs this timer, not just
+            MX's stages.
+            """
+            if timer is None:
+                return nullcontext()
+            return timer.time(f"prepare_for_generation/model_express_{name}")
+
         with timer_context:
             version = self._create_weight_version()
             try:
-                self._policy.publish_model_express_version(version.ref)
-                ready = self._control.get_weight_version(version.version_id)
-                if ready.state.value != "READY":
-                    raise RuntimeError(
-                        f"ModelExpress weight version {version.version_id!r} "
-                        "did not become READY after all trainer RPCs completed"
-                    )
-                self._generation.update_weights_from_model_express(version.ref)
+                with phase("publish"):
+                    self._policy.publish_model_express_version(version.ref)
+                    ready = self._control.get_weight_version(version.version_id)
+                    if ready.state.value != "READY":
+                        raise RuntimeError(
+                            f"ModelExpress weight version {version.version_id!r} "
+                            "did not become READY after all trainer RPCs completed"
+                        )
+                with phase("receive"):
+                    self._generation.update_weights_from_model_express(version.ref)
             finally:
                 self._control.delete_weight_version(version.version_id)
                 self._policy.release_model_express_version(version.ref)

@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -118,6 +118,56 @@ def test_sync_requires_ready_version_before_generator_update():
     generation.update_weights_from_model_express.assert_not_called()
     control.delete_weight_version.assert_called_once_with("version-1")
     policy.release_model_express_version.assert_called_once()
+
+
+class _RecordingTimer:
+    """Records span entry and exit so nesting and ordering are both checkable."""
+
+    def __init__(self):
+        self.events: list[str] = []
+
+    @contextmanager
+    def time(self, name: str):
+        self.events.append(f"enter {name}")
+        try:
+            yield
+        finally:
+            self.events.append(f"exit {name}")
+
+
+def test_sync_times_publish_and_receive_separately():
+    # Publish and receive are serialized and both on the critical path, but only
+    # receive reports MX stage telemetry, so publish cost is invisible without
+    # this split.
+    sync, _policy, _generation, _control = _sync()
+    sync.init_communicator()
+    timer = _RecordingTimer()
+
+    sync.sync_weights(timer=timer)
+
+    assert timer.events == [
+        "enter prepare_for_generation/transfer_and_update_weights",
+        "enter prepare_for_generation/model_express_publish",
+        "exit prepare_for_generation/model_express_publish",
+        "enter prepare_for_generation/model_express_receive",
+        "exit prepare_for_generation/model_express_receive",
+        "exit prepare_for_generation/transfer_and_update_weights",
+    ]
+
+
+def test_receive_is_not_timed_when_the_version_never_becomes_ready():
+    sync, _policy, _generation, control = _sync()
+    sync.init_communicator()
+    control.get_weight_version.return_value = SimpleNamespace(
+        state=SimpleNamespace(value="STAGING")
+    )
+    timer = _RecordingTimer()
+
+    with pytest.raises(RuntimeError, match="did not become READY"):
+        sync.sync_weights(timer=timer)
+
+    assert "enter prepare_for_generation/model_express_receive" not in timer.events
+    assert "exit prepare_for_generation/model_express_publish" in timer.events
 
 
 @pytest.mark.parametrize(
